@@ -3,6 +3,7 @@ version: 1.0.0
 description: "Switch between pooled provider accounts (e.g. multiple Claude logins) from chat, CLI, or the agent itself. Lists every account with its priority and active marker, moves any account to the front of the rotation, and refuses unsafe switches."
 author: hendkai
 kind: standalone
+requires_hermes: ">=0.23.0"
 provides_tools:
   - account_switch
 provides_commands:
