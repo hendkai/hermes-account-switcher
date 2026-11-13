@@ -1,4 +1,4 @@
-# account-switcher
+# credential-pool-switcher
 
 A [Hermes Agent](https://hermes-agent.nousresearch.com) plugin that lets you switch between pooled provider accounts — for example between several Claude (Anthropic) logins — from chat, the CLI, or by the agent itself.
 
@@ -9,8 +9,8 @@ Hermes rotates a *credential pool* per provider: add several OAuth logins (`herm
 This plugin adds exactly that:
 
 - **`/switch`** in any chat — `/switch list`, `/switch hendrik@…`, `/switch plan work`
-- **Tool `account_switch`** — the agent can switch accounts when you ask it to ("switch to the work account for this task")
-- **CLI `hermes account-switcher list|switch|plan`**
+- **Tool `account_switch`** — the agent can list and plan; a real switch is escalated to the human-approval gate (see Security)
+- **CLI `hermes credential-pool-switcher list|switch|plan`**
 
 ## What it does
 
@@ -20,7 +20,10 @@ This plugin adds exactly that:
 - **Plan mode** (`plan` / `dry_run`) previews the change before touching anything.
 - Verifies the switch afterwards by re-reading the pool order.
 
-Tokens are never read, printed, or written. The plugin only re-orders already-authenticated entries using Hermes' own CLI.
+## Security
+
+- **Agent-initiated switches require human approval.** Reordering the pool changes which account gets billed first, so the plugin registers a `pre_tool_call` hook that escalates every model-issued `switch` (not `list`/`plan`) to Hermes' approval gate. `/switch` and the CLI are unaffected — they are already user actions.
+- **Tokens:** switching itself never reads, prints, or writes tokens and never edits `auth.json` — it only re-orders already-authenticated entries via Hermes' own CLI. The optional usage percentages do read each pooled OAuth token in-process and send it to the provider's own API (`api.anthropic.com`) through Hermes' public `agent.account_usage.fetch_account_usage` helper; tokens are never printed, logged, or written anywhere.
 
 ## Install
 
@@ -28,7 +31,7 @@ Tokens are never read, printed, or written. The plugin only re-orders already-au
 hermes plugins install hendkai/hermes-account-switcher
 ```
 
-or clone into `~/.hermes/plugins/account-switcher` and `hermes plugins enable account-switcher`.
+or clone into `~/.hermes/plugins/credential-pool-switcher` and `hermes plugins enable credential-pool-switcher`.
 
 ## Usage
 
@@ -45,12 +48,14 @@ Agent tool:
 {"action": "switch", "target": "hendrik@kaiser-mail.de", "provider": "anthropic"}
 ```
 
+(real switches are escalated to human approval; `action: "list"` / `"plan"` run directly)
+
 CLI:
 
 ```bash
-hermes account-switcher list
-hermes account-switcher switch '#2'
-hermes account-switcher plan work
+hermes credential-pool-switcher list
+hermes credential-pool-switcher switch '#2'
+hermes credential-pool-switcher plan work
 ```
 
 ## Targets

@@ -1,10 +1,12 @@
-name: account-switcher
-version: 1.0.0
-description: "Switch between pooled provider accounts (e.g. multiple Claude logins) from chat, CLI, or the agent itself. Lists every account with its priority and active marker, moves any account to the front of the rotation, and refuses unsafe switches."
+name: credential-pool-switcher
+version: 1.1.0
+description: "Switch between pooled provider accounts (e.g. multiple Claude logins) from chat, CLI, or the agent itself. Lists every account with its priority and active marker, moves any account to the front of the rotation, refuses unsafe switches, and escalates model-initiated switches to human approval."
 author: hendkai
 kind: standalone
 requires_hermes: ">=0.23.0"
 provides_tools:
   - account_switch
+provides_hooks:
+  - pre_tool_call
 provides_commands:
-  - account-switcher
+  - credential-pool-switcher

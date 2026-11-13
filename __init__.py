@@ -1,4 +1,4 @@
-"""account-switcher — switch between pooled provider accounts.
+"""credential-pool-switcher — switch between pooled provider accounts.
 
 Works on top of Hermes' public CLI surface only:
 
@@ -11,12 +11,17 @@ Works on top of Hermes' public CLI surface only:
 
 Surfaces:
 
-* tool ``account_switch``  — the agent can switch accounts on request
+* tool ``account_switch``  — the agent can list/plan; a real switch is
+  escalated to the human-approval gate by a ``pre_tool_call`` hook
 * slash ``/switch``        — same thing from any chat
-* CLI ``hermes account-switcher list|switch|plan``
+* CLI ``hermes credential-pool-switcher list|switch|plan``
 
-The plugin never touches tokens, never re-authenticates, and never edits
-auth.json. It only re-orders the existing, already-authenticated pool.
+Switching itself never reads tokens and never edits auth.json — it only
+re-orders the existing, already-authenticated pool. The optional usage
+percentages do read each pooled OAuth token in-process and send it to the
+provider's own API (api.anthropic.com) via Hermes' public
+``agent.account_usage.fetch_account_usage`` helper; tokens are never
+printed, logged, or written anywhere.
 """
 
 from __future__ import annotations
@@ -110,8 +115,35 @@ def _run(args: List[str], timeout: int = 60) -> str:
             else:
                 os.close(fd)
                 open_fds.discard(fd)
+    timed_out = bool(open_fds)  # fds still open => child still running at the deadline
     for fd in open_fds:
         os.close(fd)
+    if timed_out:
+        # A hung `hermes` must not hang the tool or slash call: kill the child
+        # before the blocking waitpid (SIGTERM, then SIGKILL after a short grace).
+        import signal
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+        else:
+            grace = time.time() + 2.0
+            reaped = False
+            while time.time() < grace:
+                try:
+                    done, _ = os.waitpid(pid, os.WNOHANG)
+                    if done == pid:
+                        reaped = True
+                        break
+                except ChildProcessError:
+                    reaped = True
+                    break
+                time.sleep(0.05)
+            if not reaped:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
     try:
         os.waitpid(pid, 0)
     except ChildProcessError:
@@ -154,13 +186,14 @@ def _parse_list(text: str) -> tuple[str, List[Account]]:
 def _usage_for_accounts(accounts: List[Account]) -> Optional[dict]:
     """Best-effort per-account usage (5h window / week) for OAuth entries.
 
-    Uses Hermes' account_usage helper when importable (source installs).
+    Uses Hermes' public ``agent.account_usage.fetch_account_usage`` helper in
+    read-only mode when importable (source installs).
     Returns {label: {"five_hour": pct, "week": pct, "reset": str}} or None.
     Tokens are used in-process for the API call and never returned.
     """
     try:
+        from agent.account_usage import fetch_account_usage  # type: ignore
         from agent.credential_pool import load_pool  # type: ignore
-        from agent.account_usage import _fetch_anthropic_account_usage  # type: ignore
     except Exception:
         return None
     out: dict = {}
@@ -175,7 +208,7 @@ def _usage_for_accounts(accounts: List[Account]) -> Optional[dict]:
                 token = (getattr(entry, "access_token", "") or "").strip()
                 if not token:
                     continue
-                snap = _fetch_anthropic_account_usage(api_key=token)
+                snap = fetch_account_usage("anthropic", api_key=token, read_only=True)
                 if snap is None:
                     continue
                 windows = {}
@@ -338,6 +371,37 @@ def render_switch(plan: dict, markdown: bool = False) -> str:
 
 # -- plugin surfaces ----------------------------------------------------------
 
+def _on_pre_tool_call(tool_name: str = "", args: Optional[dict] = None, **_: Any) -> Optional[dict]:
+    """Escalate model-initiated real switches to the human-approval gate.
+
+    Reordering the credential pool changes which account gets billed first,
+    so a ``switch`` issued by the model must not run silently — a
+    prompt-injected turn could otherwise redirect spend. Read-only calls
+    (``list``, ``plan``, ``dry_run``) pass through untouched. Never raises:
+    a broken gate must not break every other tool.
+    """
+    try:
+        if tool_name != "account_switch" or not isinstance(args, dict):
+            return None
+        if args.get("action") != "switch":
+            return None
+        if not str(args.get("target") or "").strip():
+            return None  # switch without target just lists
+        if args.get("dry_run"):
+            return None
+        return {
+            "action": "approve",
+            "message": (
+                "account_switch: move "
+                f"'{args.get('target')}' to priority 0 of the "
+                f"{args.get('provider') or DEFAULT_PROVIDER} credential pool "
+                "(changes which account is tried/billed first)."
+            ),
+        }
+    except Exception:
+        return None
+
+
 def _tool_account_switch(
     action: str = "switch",
     target: str = "",
@@ -402,9 +466,10 @@ def _slash(arg: str = "", **_: Any) -> str:
 
 
 def register(ctx) -> None:
+    ctx.register_hook("pre_tool_call", _on_pre_tool_call)
     ctx.register_tool(
         name="account_switch",
-        toolset="plugin_account_switcher",
+        toolset="plugin_credential_pool_switcher",
         schema={
             "type": "object",
             "properties": {
@@ -431,11 +496,13 @@ def register(ctx) -> None:
             "List or switch the active account of a provider credential pool "
             "(e.g. which Claude login Hermes uses). action=list shows all "
             "accounts with priorities; action=switch moves the target account "
-            "to the front of the rotation; action=plan previews the switch."
+            "to the front of the rotation (escalated to human approval — "
+            "it changes which account is billed first); action=plan previews "
+            "the switch."
         ),
     )
     ctx.register_cli_command(
-        name="account-switcher",
+        name="credential-pool-switcher",
         help="Switch between pooled provider accounts (e.g. multiple Claude logins)",
         setup_fn=_setup_argparse,
         handler_fn=_handle_cli,
