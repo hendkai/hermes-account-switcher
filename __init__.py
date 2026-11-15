@@ -451,7 +451,43 @@ def _managed_oauth_labels(provider: str) -> dict:
     return out
 
 
-def _usage_limits(tokens: dict) -> dict:
+def _current_bench_resets(provider: str) -> dict:
+    """{label: reset_at_iso} for rows currently benched with a future reset.
+
+    Lets the auto rotation skip the usage endpoint entirely for logins whose
+    bench (set from the same endpoint's data) has not expired yet — the
+    /api/oauth/usage endpoint rate-limits aggressively (429) when polled
+    every cycle for every account.
+    """
+    try:
+        from hermes_cli.auth import read_credential_pool
+    except Exception:
+        return {}
+    import re as _re
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    out: dict = {}
+    try:
+        for row in read_credential_pool(provider):
+            if not isinstance(row, dict) or row.get("last_status") != "exhausted":
+                continue
+            reset = str(row.get("last_error_reset_at") or "").strip()
+            m = _re.match(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})([+-]\d{2}:\d{2})?", reset)
+            if not m:
+                continue
+            try:
+                dt = datetime.fromisoformat(m.group(1) + (m.group(2) or "+00:00"))
+            except ValueError:
+                continue
+            if dt > now:
+                out[str(row.get("label") or "")] = reset
+    except Exception:
+        return {}
+    return out
+
+
+def _usage_limits(tokens: dict, cached_benches: Optional[dict] = None) -> dict:
     """Per-login verdict from Anthropic's own usage endpoint.
 
     ``{label: {"dead_until": iso|None, "active_limits": [...], "week_pct": float,
@@ -464,8 +500,22 @@ def _usage_limits(tokens: dict) -> dict:
         from agent.account_usage import _get_json
     except Exception:
         return {label: {"error": "agent.account_usage not importable"} for label in tokens}
+    cached = cached_benches or {}
     out: dict = {}
     for label, token in tokens.items():
+        if label in cached:
+            # Still benched with a future reset set from this same endpoint:
+            # no network call — the /api/oauth/usage endpoint 429s when every
+            # cycle re-asks for every login.
+            out[label] = {
+                "dead_until": cached[label],
+                "active_limits": ["cached bench"],
+                "week_pct": None,
+                "session_pct": None,
+                "scoped_pct": None,
+                "scoped_active": True,
+            }
+            continue
         try:
             payload = _get_json(
                 "https://api.anthropic.com/api/oauth/usage",
@@ -585,7 +635,9 @@ def auto_rotate(
         return {"ok": False, "error": "pool rows and auth list disagree; nothing to manage."}
 
     # Ground truth #1: Anthropic's usage endpoint (limits[] with is_active).
-    usage = _usage_limits(tokens)
+    # Logins with a future-dated bench are answered from the stored bench —
+    # no network call (the usage endpoint 429s under per-cycle polling).
+    usage = _usage_limits(tokens, cached_benches=_current_bench_resets(provider))
     dead: list = []          # (account, {"reset_at", "why"})
     alive: list = []         # usage says alive
     unknown: list = []       # usage fetch failed → untouched this round
