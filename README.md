@@ -35,8 +35,11 @@ or clone into `~/.hermes/plugins/credential-pool-switcher` and `hermes plugins e
 
 ## Usage
 
+> ⛔ marks benched (exhausted) logins with their remaining cooldown.
+
 ```text
-/switch list                 → show all accounts and priorities
+/switch list                 → show all accounts and priorities (⛔ = benched)
+/switch auto                 → probe logins, bench dead ones, promote the healthiest
 /switch snailberg@           → move that account to the front
 /switch plan snailberg@      → dry-run preview
 /switch --provider=anthropic …  → other pooled providers
@@ -65,3 +68,15 @@ A target can be `#index`, an exact label, an entry id, or a unique label prefix 
 ## License
 
 MIT
+
+
+## Auto rotation (`auto`)
+
+Reads Anthropic's own usage endpoint per login: any active `limits[]` entry at
+100% / severity `critical` benches that login until its `resets_at`; the
+login with the most weekly headroom is promoted to priority 0; a probed-alive
+login that still carries a bench is unbenched. An optional 4-token probe call
+double-checks usage-healthy logins before they get priority 0 (catches org
+spend caps the usage windows do not show). The tool path is escalated to
+human approval like `switch`; the CLI (`hermes account-switcher auto`) is
+meant for unattended cron runs.

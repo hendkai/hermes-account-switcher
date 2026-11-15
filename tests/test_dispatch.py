@@ -86,6 +86,14 @@ def plugin(monkeypatch):
             "ok": True, "moved": target, "provider": provider, "dry_run": dry_run,
         },
     )
+    monkeypatch.setattr(
+        mod, "auto_rotate",
+        lambda provider="anthropic", probe=True, dry_run=False: {
+            "ok": True, "provider": provider, "probed": probe, "dry_run": dry_run,
+            "alive": ["acct-a"], "dead": {}, "benched": {}, "cleared": [],
+            "promoted": "acct-a", "all_dead": False,
+        },
+    )
     ctx = _Ctx()
     mod.register(ctx)
     return mod, ctx
@@ -132,5 +140,29 @@ def test_registered_schema_exposes_parameters(plugin):
     assert isinstance(params, dict)
     props = params.get("properties")
     assert isinstance(props, dict)
-    assert set(props) >= {"action", "target", "provider", "dry_run"}
-    assert props["action"]["enum"] == ["list", "switch", "plan"]
+    assert set(props) >= {"action", "target", "provider", "dry_run", "probe"}
+    assert props["action"]["enum"] == ["list", "switch", "plan", "auto"]
+
+
+def test_dispatch_auto_routes_rotation(plugin, monkeypatch):
+    seen = {}
+
+    def fake_auto(provider="anthropic", probe=True, dry_run=False, **kw):
+        seen.update(provider=provider, probe=probe, dry_run=dry_run)
+        return {"ok": True, "alive": ["acct-a"]}
+
+    mod, _ = plugin
+    monkeypatch.setattr(mod, "auto_rotate", fake_auto)
+    out = registry.dispatch("account_switch", {"action": "auto", "dry_run": True})
+    data = json.loads(out)
+    assert data["ok"] is True
+    assert seen == {"provider": "anthropic", "probe": True, "dry_run": True}
+
+
+def test_gate_escalates_auto_but_not_dry_run(plugin):
+    mod, ctx = plugin
+    gate = ctx.hooks["pre_tool_call"]
+    real = gate(tool_name="account_switch", args={"action": "auto"})
+    assert real and real["action"] == "approve" and "auto-rotate" in real["message"]
+    dry = gate(tool_name="account_switch", args={"action": "auto", "dry_run": True})
+    assert dry is None
