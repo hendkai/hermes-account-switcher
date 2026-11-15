@@ -217,44 +217,42 @@ def _parse_list(text: str) -> tuple[str, List[Account]]:
 # -- optional usage enrichment -------------------------------------------------
 
 def _usage_for_accounts(accounts: List[Account]) -> Optional[dict]:
-    """Best-effort per-account usage (5h window / week) for OAuth entries.
+    """Best-effort per-account usage for OAuth entries.
 
-    Uses Hermes' public ``agent.account_usage.fetch_account_usage`` helper in
-    read-only mode when importable (source installs).
-    Returns {label: {"five_hour": pct, "week": pct, "reset": str}} or None.
-    Tokens are used in-process for the API call and never returned.
+    One raw ``/api/oauth/usage`` fetch per login (token used in-process,
+    never returned): the 5h session window, the overall weekly window, and
+    the model-scoped weekly budget (the Fable/Opus limit) that the plain
+    windows hide. Returns ``{label: {"five_hour": ..., "week": ...,
+    "scoped": {"used_percent", "active"}}}`` or None.
     """
     try:
-        from agent.account_usage import fetch_account_usage  # type: ignore
         from agent.credential_pool import load_pool  # type: ignore
     except Exception:
         return None
-    out: dict = {}
+    tokens: dict = {}
     try:
-        pool = load_pool("anthropic")
-        by_label = {a.label: a for a in accounts}
-        for entry in pool.entries():
+        by_label = {a.label for a in accounts}
+        for entry in load_pool("anthropic").entries():
             label = str(getattr(entry, "label", "") or "")
             if label not in by_label or getattr(entry, "auth_type", "") != "oauth":
                 continue
-            try:
-                token = (getattr(entry, "access_token", "") or "").strip()
-                if not token:
-                    continue
-                snap = fetch_account_usage("anthropic", api_key=token, read_only=True)
-                if snap is None:
-                    continue
-                windows = {}
-                for w in snap.windows:
-                    if w.label in ("Current session", "Current week"):
-                        windows["five_hour" if "session" in w.label.lower() else "week"] = {
-                            "used_percent": w.used_percent,
-                        }
-                out[label] = windows
-            except Exception:
-                continue
+            token = (getattr(entry, "access_token", "") or "").strip()
+            if token:
+                tokens[label] = token
     except Exception:
-        return out or None
+        return None
+    if not tokens:
+        return None
+    limits = _usage_limits(tokens)
+    out: dict = {}
+    for label, info in limits.items():
+        if info.get("error"):
+            continue
+        out[label] = {
+            "five_hour": {"used_percent": info.get("session_pct")},
+            "week": {"used_percent": info.get("week_pct")},
+            "scoped": {"used_percent": info.get("scoped_pct"), "active": info.get("scoped_active")},
+        }
     return out or None
 
 
@@ -480,11 +478,19 @@ def _usage_limits(tokens: dict) -> dict:
             continue
         dead_until: Optional[str] = None
         active: list = []
+        scoped_pct = None
+        scoped_active = False
         for lim in payload.get("limits") or []:
             if not isinstance(lim, dict) or not lim.get("is_active"):
+                if isinstance(lim, dict) and str(lim.get("kind") or "") == "weekly_scoped":
+                    scoped_pct = lim.get("percent")
+                    scoped_active = False
                 continue
             pct = lim.get("percent")
             critical = str(lim.get("severity") or "").lower() == "critical"
+            if str(lim.get("kind") or "") == "weekly_scoped":
+                scoped_pct = pct
+                scoped_active = True
             if (isinstance(pct, (int, float)) and pct >= 100) or critical:
                 active.append(f"{lim.get('kind')}={pct}%")
                 reset = lim.get("resets_at")
@@ -497,6 +503,8 @@ def _usage_limits(tokens: dict) -> dict:
             "active_limits": active,
             "week_pct": seven.get("utilization"),
             "session_pct": five.get("utilization"),
+            "scoped_pct": scoped_pct,
+            "scoped_active": scoped_active,
         }
     return out
 
@@ -666,6 +674,10 @@ def render_list(data: dict, markdown: bool = False) -> str:
                 pct = (u.get(key) or {}).get("used_percent")
                 if pct is not None:
                     parts.append(f"{short} {round(pct)}%")
+            scoped = u.get("scoped") or {}
+            if scoped.get("used_percent") is not None:
+                flag = "⛔" if scoped.get("active") else ""
+                parts.append(f"scoped {round(scoped['used_percent'])}%{flag}")
             usage = " · " + " ".join(parts) if parts else ""
         lines.append(
             f"{mark}#{a['index']} {a['label']} — priority {a['priority']}"
