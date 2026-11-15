@@ -26,6 +26,7 @@ printed, logged, or written anywhere.
 
 from __future__ import annotations
 
+import json
 import re
 
 from dataclasses import dataclass, field
@@ -70,6 +71,32 @@ def _hermes_bin() -> str:
     return "hermes"
 
 
+def _run_subprocess(argv: List[str], timeout: int = 60) -> str:
+    """Windows fallback for :func:`_run`: plain ``subprocess.run`` with a hard
+    timeout. On ``TimeoutExpired`` the partial output is still returned so a
+    hung ``hermes`` cannot hang the tool call."""
+    import os
+    import subprocess
+
+    try:
+        proc = subprocess.run(
+            argv,
+            capture_output=True,
+            timeout=timeout,
+            stdin=subprocess.DEVNULL,
+            env=os.environ,
+        )
+        raw = (proc.stdout or b"") + b"\n" + (proc.stderr or b"")
+    except subprocess.TimeoutExpired as exc:
+        raw = (exc.stdout or b"") + b"\n" + (exc.stderr or b"")
+    out = raw.decode("utf-8", "replace")
+    lines = [
+        ln for ln in out.splitlines()
+        if "source update" not in ln and ln.strip()
+    ]
+    return "\n".join(lines)
+
+
 def _run(args: List[str], timeout: int = 60) -> str:
     """Run `hermes <args>` and return combined output.
 
@@ -78,11 +105,15 @@ def _run(args: List[str], timeout: int = 60) -> str:
     identically on macOS and Linux.
     """
     import os
-    import select
-    import time
 
     binpath = _hermes_bin()
     argv = [binpath, *args]
+    if not hasattr(os, "posix_spawn"):
+        # Windows: no posix_spawn (and no select on pipes) — use subprocess.
+        return _run_subprocess(argv, timeout)
+    import select
+    import time
+
     r_out, w_out = os.pipe()
     r_err, w_err = os.pipe()
     devnull = os.open(os.devnull, os.O_RDONLY)
@@ -402,24 +433,29 @@ def _on_pre_tool_call(tool_name: str = "", args: Optional[dict] = None, **_: Any
         return None
 
 
-def _tool_account_switch(
-    action: str = "switch",
-    target: str = "",
-    provider: str = DEFAULT_PROVIDER,
-    dry_run: bool = False,
-    **_: Any,
-) -> dict:
+def _tool_account_switch(args: dict, **_: Any) -> str:
     """Tool: list pooled accounts or switch the active one.
 
-    action: 'list' | 'switch' | 'plan' (plan = dry-run switch)
+    Hermes dispatches plugin handlers as ``handler(args, **kwargs)`` — the
+    whole argument dict arrives positionally, so take the dict and read the
+    fields out of it. Returns a JSON string (the tool result contract).
     """
+    if not isinstance(args, dict):
+        args = {}
+    action = str(args.get("action") or "switch")
+    target = str(args.get("target") or "")
+    provider = str(args.get("provider") or DEFAULT_PROVIDER) or DEFAULT_PROVIDER
+    dry_run = bool(args.get("dry_run", False))
+    result: dict
     if action == "list" or (action == "switch" and not target):
-        return list_accounts(provider)
-    if action == "plan":
-        return switch(target, provider, dry_run=True)
-    if action == "switch":
-        return switch(target, provider, dry_run=dry_run)
-    return {"ok": False, "error": f"Unknown action '{action}'. Use list, switch, or plan."}
+        result = list_accounts(provider)
+    elif action == "plan":
+        result = switch(target, provider, dry_run=True)
+    elif action == "switch":
+        result = switch(target, provider, dry_run=dry_run)
+    else:
+        result = {"ok": False, "error": f"Unknown action '{action}'. Use list, switch, or plan."}
+    return json.dumps(result, default=str)
 
 
 def _setup_argparse(p) -> None:
@@ -471,24 +507,31 @@ def register(ctx) -> None:
         name="account_switch",
         toolset="plugin_credential_pool_switcher",
         schema={
-            "type": "object",
-            "properties": {
-                "action": {
-                    "type": "string",
-                    "enum": ["list", "switch", "plan"],
-                    "description": "list = show all pooled accounts; switch = move target to priority 0; plan = dry-run preview",
-                    "default": "switch",
+            "name": "account_switch",
+            "description": (
+                "List or switch the active account of a provider credential pool "
+                "(e.g. which Claude login Hermes uses)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["list", "switch", "plan"],
+                        "description": "list = show all pooled accounts; switch = move target to priority 0; plan = dry-run preview",
+                        "default": "switch",
+                    },
+                    "target": {
+                        "type": "string",
+                        "description": "#index, exact label, entry id, or unique label prefix (required for switch/plan)",
+                    },
+                    "provider": {
+                        "type": "string",
+                        "description": "provider id of the credential pool",
+                        "default": "anthropic",
+                    },
+                    "dry_run": {"type": "boolean", "default": False},
                 },
-                "target": {
-                    "type": "string",
-                    "description": "#index, exact label, entry id, or unique label prefix (required for switch/plan)",
-                },
-                "provider": {
-                    "type": "string",
-                    "description": "provider id of the credential pool",
-                    "default": "anthropic",
-                },
-                "dry_run": {"type": "boolean", "default": False},
             },
         },
         handler=_tool_account_switch,
