@@ -658,6 +658,116 @@ def _strategy_note(provider: str, strategy: str) -> Optional[str]:
     return None
 
 
+PLUGIN_ID = "credential-pool-switcher"
+STATUS_LINE_PREFIX = "CPS_STATUS "  # sentinel the desktop half parses out of `status --json`
+
+
+def _notify_changed(provider: str) -> None:
+    """Tell connected desktop windows the pool order/bench state changed (no-op outside the gateway).
+
+    Only inside a process that already runs the gateway transport: importing it
+    from a plain CLI run (cron, ``cli.exec``) would pull in the whole transport
+    stack, which takes over stdout — and there is no desktop client to reach anyway.
+    """
+    import sys
+
+    if "tui_gateway.server" not in sys.modules:
+        return
+    try:
+        from hermes_cli.plugin_events import broadcast_plugin_event
+        broadcast_plugin_event(PLUGIN_ID, "pool.changed", {"provider": provider})
+    except Exception as exc:
+        log.debug("pool.changed broadcast skipped: %s", exc)
+
+
+def _is_benched(account: Account, now: float) -> bool:
+    if account.status != STATUS_EXHAUSTED:
+        return False
+    if account.bench_until is not None:
+        return account.bench_until > now
+    return bool(account.notes)  # CLI fallback: only "(… left)" is known
+
+
+def pool_status(provider: str = DEFAULT_PROVIDER) -> dict:
+    """Cheap snapshot for status indicators: no usage fetch, no token refresh, no network.
+
+    ``state``: ``setup`` (no accounts yet), ``ok`` (all usable), ``degraded``
+    (some benched/dead, at least one usable), ``exhausted`` (none usable).
+    ``active`` is the entry Hermes tries next: the lowest priority that is
+    neither dead nor still benched.
+    """
+    provider_found, accounts = _read_accounts(provider)
+    provider = provider_found or provider
+    now = time.time()
+    usable = [a for a in accounts if a.status != STATUS_DEAD and not _is_benched(a, now)]
+    active = min(usable, key=lambda a: a.priority) if usable else None
+    benched_until = [a.bench_until for a in accounts if a.bench_until and a.bench_until > now]
+    if not accounts:
+        state = "setup"
+    elif not usable:
+        state = "exhausted"
+    elif len(usable) < len(accounts):
+        state = "degraded"
+    else:
+        state = "ok"
+    rows = []
+    for a in accounts:
+        status = "dead" if a.status == STATUS_DEAD else ("benched" if _is_benched(a, now) else "ok")
+        rows.append({
+            "index": a.index,
+            "label": a.label,
+            "priority": a.priority,
+            "auth_type": a.auth_type,
+            "source": a.source,
+            "status": status,
+            "active": active is not None and a.id == active.id,
+            "bench_until": _iso_utc(a.bench_until) if a.bench_until else None,
+            "bench_left": (a.notes[0].strip("()").removesuffix(" left") if status == "benched" and a.notes else None),
+            # Only a usable account that is not already next: switching onto a
+            # benched one changes nothing until its reset.
+            "switchable": (status == "ok" and _switch_blocker(a, provider) is None
+                           and not (active is not None and a.id == active.id)),
+            "relogin_hint": _relogin_hint(provider, a.label, a.source) if status == "dead" else None,
+        })
+    return {
+        "provider": provider,
+        "state": state,
+        "strategy": _pool_strategy(provider),
+        "strategy_note": _strategy_note(provider, _pool_strategy(provider)),
+        "count": len(accounts),
+        "usable": len(usable),
+        "active": next((r for r in rows if r["active"]), None),
+        "next_ready_at": _iso_utc(min(benched_until)) if benched_until else None,
+        "add_hint": _add_hint(provider),
+        "accounts": rows,
+    }
+
+
+def render_setup(status: dict, markdown: bool = False) -> str:
+    """Onboarding text that adapts to the current pool state."""
+    b = "**" if markdown else ""
+    tick = "`" if markdown else ""
+    provider = status["provider"]
+    lines = [f"{b}Account switcher setup ({provider}){b}"]
+    if status["state"] == "setup":
+        lines.append("No accounts yet. They live in Hermes' credential pool (~/.hermes/auth.json).")
+    else:
+        lines.append(f"{status['count']} account(s) in the pool, {status['usable']} usable right now"
+                     + (f" — Hermes uses {status['active']['label']} next." if status.get("active") else "."))
+    lines += [
+        f"1. Add each Claude account once (opens the browser login): {tick}{_add_hint(provider)}{tick}",
+        f"2. Check: {tick}/switch list{tick} — or the status bar chip in the desktop app.",
+        f"3. Pick one by hand: {tick}/switch <label>{tick}; or rotate by real quota: {tick}/switch auto{tick}"
+        f" (unattended: run {tick}hermes {PLUGIN_ID} auto{tick} from cron every 30 min).",
+    ]
+    for row in status["accounts"]:
+        if row["status"] == "dead":
+            lines.append(f"✖ {row['label']} is dead — {row['relogin_hint']}")
+    if status.get("strategy_note"):
+        lines.append(f"⚠ {status['strategy_note']}")
+    return "\n".join(lines)
+
+
 def _move_to_front(provider: str, account: Account) -> Optional[str]:
     """Move *account* to priority 0. Returns an error string or None."""
     pool = _load_pool(provider)
@@ -725,6 +835,7 @@ def switch(
     error = _move_to_front(provider, account)
     if error:
         return {"ok": False, "error": error}
+    _notify_changed(provider)
 
     # Verification only needs the order — no usage fetch (the usage endpoint 429s).
     after = list_accounts(provider, with_usage=False)
@@ -1019,6 +1130,8 @@ def auto_rotate(
         report["ok"] = False
         report["error"] = error
         return report
+    if to_bench or cleared:
+        _notify_changed(provider)
 
     if alive:
         best = sorted(alive, key=lambda a: (_week_pct(a), _session_pct(a), a["priority"]))[0]
@@ -1232,6 +1345,11 @@ def _setup_argparse(p) -> None:
     au.add_argument("--provider", default=DEFAULT_PROVIDER)
     au.add_argument("--no-probe", action="store_true", help="reorder by usage windows only, no test call")
     au.add_argument("--dry-run", action="store_true")
+    st = sub.add_parser("status", help="pool snapshot for status indicators (no network)")
+    st.add_argument("--provider", default=DEFAULT_PROVIDER)
+    st.add_argument("--json", action="store_true", help=f"one '{STATUS_LINE_PREFIX.strip()} <json>' line")
+    se = sub.add_parser("setup", help="how to add accounts and what to do next")
+    se.add_argument("--provider", default=DEFAULT_PROVIDER)
 
 
 def _arg(args, name: str, default):
@@ -1253,10 +1371,20 @@ def _handle_cli(args) -> None:
             probe=not _arg(args, "no_probe", False),
             dry_run=_arg(args, "dry_run", False),
         )))
+    elif cmd == "status":
+        status = pool_status(_arg(args, "provider", DEFAULT_PROVIDER))
+        if _arg(args, "json", False):
+            print(STATUS_LINE_PREFIX + json.dumps(status, default=str))
+        else:
+            active = status.get("active")
+            print(f"{status['provider']}: {status['state']} · {status['usable']}/{status['count']} usable"
+                  + (f" · next: {active['label']}" if active else ""))
+    elif cmd == "setup":
+        print(render_setup(pool_status(_arg(args, "provider", DEFAULT_PROVIDER))))
 
 
 _SLASH_USAGE = (
-    "Usage: /switch [list] · /switch auto [--dry-run] [--no-probe] · "
+    "Usage: /switch [list] · /switch setup · /switch auto [--dry-run] [--no-probe] · "
     "/switch <label> · /switch plan <label> · --provider=<id>\n"
     "Accounts live in Hermes' credential pool (~/.hermes/auth.json). Add one: "
     "hermes auth add anthropic --type oauth --label <name>"
@@ -1277,6 +1405,8 @@ def _slash(arg: str = "", **_: Any) -> str:
         return render_list(list_accounts(provider), markdown=True)
     if parts[0] in {"help", "-h", "--help"}:
         return _SLASH_USAGE
+    if parts[0] in {"setup", "onboarding"}:
+        return render_setup(pool_status(provider), markdown=True)
     if parts[0] == "auto":
         return render_auto(auto_rotate(provider, probe="--no-probe" not in parts,
                                        dry_run="--dry-run" in parts), markdown=True)
@@ -1349,6 +1479,6 @@ def register(ctx) -> None:
     ctx.register_command(
         "switch",
         handler=_slash,
-        description="Switch pooled accounts (/switch list, /switch <label>, /switch auto)",
-        args_hint="[list|auto|<label>|plan <label>] [--provider=<id>]",
+        description="Switch pooled accounts (/switch list, /switch setup, /switch <label>, /switch auto)",
+        args_hint="[list|setup|auto|<label>|plan <label>] [--provider=<id>]",
     )

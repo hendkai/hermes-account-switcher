@@ -344,6 +344,74 @@ def test_dead_logins_get_source_specific_relogin_hint(mod):
     assert "auth.json" in text
 
 
+# -- status indicator --------------------------------------------------------------------
+
+def test_pool_status_states_and_active(mod, monkeypatch):
+    monkeypatch.setattr(mod, "_pool_strategy", lambda p: "fill_first")
+    monkeypatch.setattr(mod, "_read_accounts", lambda p: (p, []))
+    empty = mod.pool_status()
+    assert empty["state"] == "setup" and empty["active"] is None
+    assert "hermes auth add anthropic" in empty["add_hint"]
+
+    now = time.time()
+    accounts = [
+        _acct(mod, 0, "dead@x", status="dead"),
+        _acct(mod, 1, "bench@x", status="exhausted", bench_until=now + 600, notes=["(10m left)"]),
+        _acct(mod, 2, "ok@x"),
+        _acct(mod, 3, "spare@x"),
+    ]
+    monkeypatch.setattr(mod, "_read_accounts", lambda p: (p, accounts))
+    st = mod.pool_status()
+    assert st["state"] == "degraded" and st["usable"] == 2 and st["count"] == 4
+    assert st["active"]["label"] == "ok@x"
+    rows = {r["label"]: r for r in st["accounts"]}
+    assert rows["dead@x"]["status"] == "dead" and "hermes auth remove" in rows["dead@x"]["relogin_hint"]
+    assert rows["bench@x"]["status"] == "benched" and rows["bench@x"]["bench_left"] == "10m"
+    assert [l for l, r in rows.items() if r["switchable"]] == ["spare@x"]
+
+    monkeypatch.setattr(mod, "_read_accounts", lambda p: (p, accounts[:2]))
+    st = mod.pool_status()
+    assert st["state"] == "exhausted" and st["active"] is None and st["next_ready_at"]
+
+
+def test_status_cli_prints_sentinel_json_line(mod, monkeypatch, capsys):
+    import json as _json
+    monkeypatch.setattr(mod, "pool_status", lambda p="anthropic": {"provider": p, "state": "setup"})
+    mod._handle_cli(SimpleNamespace(cmd="status", provider="anthropic", json=True))
+    line = capsys.readouterr().out.strip()
+    assert line.startswith(mod.STATUS_LINE_PREFIX)
+    assert _json.loads(line[len(mod.STATUS_LINE_PREFIX):])["state"] == "setup"
+
+
+def test_setup_text_adapts_to_pool(mod, monkeypatch):
+    monkeypatch.setattr(mod, "_pool_strategy", lambda p: "fill_first")
+    monkeypatch.setattr(mod, "_read_accounts", lambda p: (p, []))
+    assert "No accounts yet" in mod._slash("setup")
+    monkeypatch.setattr(mod, "_read_accounts", lambda p: (p, [_acct(mod, 0, "a@x"), _acct(mod, 1, "d@x", status="dead")]))
+    text = mod._slash("setup")
+    assert "Hermes uses a@x next" in text and "d@x is dead" in text
+
+
+def test_switch_broadcasts_pool_changed(mod, monkeypatch):
+    sent = []
+    monkeypatch.setitem(sys.modules, "tui_gateway.server", types.ModuleType("tui_gateway.server"))
+    _fake_module(monkeypatch, "hermes_cli.plugin_events",
+                 broadcast_plugin_event=lambda pid, ev, payload=None: sent.append((pid, ev, payload)))
+    monkeypatch.setattr(mod, "_read_accounts", lambda p: (p, [_acct(mod, 0, "a@x"), _acct(mod, 1, "b@x")]))
+    monkeypatch.setattr(mod, "_pool_strategy", lambda p: "fill_first")
+    monkeypatch.setattr(mod, "_move_to_front", lambda p, a: None)
+    monkeypatch.setattr(mod, "list_accounts", lambda p="anthropic", with_usage=True: {"accounts": []})
+    mod.switch("b@x")
+    assert sent == [("credential-pool-switcher", "pool.changed", {"provider": "anthropic"})]
+
+
+def test_broadcast_skipped_outside_gateway(mod, monkeypatch):
+    monkeypatch.delitem(sys.modules, "tui_gateway.server", raising=False)
+    _fake_module(monkeypatch, "hermes_cli.plugin_events",
+                 broadcast_plugin_event=lambda *a, **k: pytest.fail("must not broadcast from a CLI process"))
+    mod._notify_changed("anthropic")
+
+
 # -- slash -------------------------------------------------------------------------------
 
 def test_slash_plan_without_target_shows_usage(mod, monkeypatch):

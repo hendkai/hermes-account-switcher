@@ -75,6 +75,27 @@ each dead entry.
 **Unattended rotation:** run `hermes credential-pool-switcher auto` from cron
 (e.g. every 30 minutes).
 
+`/switch setup` (or `hermes credential-pool-switcher setup`) prints these steps
+adapted to your current pool.
+
+## Status bar indicator (desktop app)
+
+The package ships a desktop half (`desktop/plugin.js`). Hermes copies it into
+the app automatically; enable it once under **Capabilities → Plugins**
+(desktop halves are opt-in). It adds a chip at the bottom right:
+
+- **Set up Claude accounts** (amber) while the pool is empty — click for the
+  onboarding steps with copyable commands.
+- Afterwards the **account Hermes uses next**, coloured by pool health:
+  green = all usable, amber = some benched or dead, red = none usable (with the
+  time the next one is free).
+- Click it for every account's state; click a usable account to put it first;
+  copy the command to revive a dead login or add another; run auto rotation.
+
+It reads `hermes credential-pool-switcher status --json` — a local snapshot
+without network calls or token refreshes — every 90 s, and refreshes at once
+when a switch or auto run happens inside the gateway.
+
 ## Usage
 
 ```text
