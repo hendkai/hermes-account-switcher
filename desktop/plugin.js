@@ -6,13 +6,12 @@
  *   • accounts present → the account Hermes uses next, coloured by pool health
  *                        (green = all usable, amber = some benched/dead, red = none usable)
  * Popover: every pooled account with its state; click a usable one to move it to
- * the front; copyable commands for adding accounts and reviving dead logins;
- * buttons for auto rotation and refresh.
+ * the front; copyable commands for adding accounts and reviving dead logins.
  *
  * Data: host.request('cli.exec', ['credential-pool-switcher', 'status', '--json'])
  * — a cheap pool snapshot (no network, no token refresh) from the Python half.
  * Live updates: the Python half broadcasts plugin.credential-pool-switcher.pool.changed
- * when a switch/auto run happens inside the gateway; polling covers cron runs.
+ * when a switch happens inside the gateway; polling covers changes made elsewhere.
  *
  * Plain ESM, loaded uncompiled: only @hermes/plugin-sdk, react, react/jsx-runtime resolve.
  */
@@ -39,7 +38,6 @@ const MESSAGES = {
     setupIntro: 'No accounts yet. The switcher works on Hermes\u2019 credential pool (~/.hermes/auth.json).',
     step1: 'Add each Claude account once \u2014 opens the browser login:',
     step2: 'Repeat for every account, then come back here: the indicator switches to the account in use.',
-    step3: 'Optional: rotate by real quota every 30 min (cron):',
     allExhausted: 'Claude: all exhausted',
     readyAt: (t) => `next ready ${t}`,
     inUse: 'in use',
@@ -51,12 +49,9 @@ const MESSAGES = {
     usable: (n, total) => `${n} of ${total} usable`,
     revive: 'Revive dead login:',
     addMore: 'Add another account:',
-    auto: 'Auto-rotate now',
     refresh: 'Refresh',
     switched: (label) => `Claude account switched: ${label} is used first`,
     switchFailed: (msg) => `Switch failed: ${msg}`,
-    autoDone: 'Auto rotation finished',
-    autoFailed: (msg) => `Auto rotation failed: ${msg}`,
     loadFailed: 'Account switcher unavailable',
     retry: 'click to retry'
   },
@@ -66,7 +61,6 @@ const MESSAGES = {
     setupIntro: 'Noch keine Accounts hinterlegt. Der Switcher nutzt den Credential-Pool von Hermes (~/.hermes/auth.json).',
     step1: 'Jeden Claude-Account einmal hinzuf\u00fcgen \u2014 \u00f6ffnet den Browser-Login:',
     step2: 'F\u00fcr jeden Account wiederholen. Danach zeigt der Indikator hier den aktiven Account.',
-    step3: 'Optional: alle 30 Min. nach echtem Verbrauch rotieren (Cron):',
     allExhausted: 'Claude: alle ersch\u00f6pft',
     readyAt: (t) => `wieder frei ${t}`,
     inUse: 'aktiv',
@@ -78,12 +72,9 @@ const MESSAGES = {
     usable: (n, total) => `${n} von ${total} nutzbar`,
     revive: 'Toten Login wiederbeleben:',
     addMore: 'Weiteren Account hinzuf\u00fcgen:',
-    auto: 'Jetzt auto-rotieren',
     refresh: 'Aktualisieren',
     switched: (label) => `Claude-Account gewechselt: ${label} wird zuerst genutzt`,
     switchFailed: (msg) => `Wechsel fehlgeschlagen: ${msg}`,
-    autoDone: 'Auto-Rotation fertig',
-    autoFailed: (msg) => `Auto-Rotation fehlgeschlagen: ${msg}`,
     loadFailed: 'Account-Switcher nicht erreichbar',
     retry: 'Klick = erneut versuchen'
   }
@@ -92,7 +83,7 @@ const MESSAGES = {
 // ── data ──────────────────────────────────────────────────────────────────────
 
 async function runCli(argv, timeout = 60) {
-  // The RPC timeout must outlast the CLI's own (an auto run probes every login).
+  // The RPC timeout must outlast the CLI's own.
   const result = await host.request('cli.exec', { argv: [CLI, ...argv], timeout }, (timeout + 15) * 1000)
   if (result?.blocked) throw new Error(result.hint || 'blocked')
   return { code: result?.code ?? -1, output: String(result?.output || '') }
@@ -156,9 +147,7 @@ function SetupSteps({ status, t }) {
       jsx('p', { className: 'text-(--ui-text-secondary)', children: t('setupIntro') }),
       jsx('p', { children: `1. ${t('step1')}` }),
       jsx(CommandLine, { text: status.add_hint }),
-      jsx('p', { children: `2. ${t('step2')}` }),
-      jsx('p', { children: `3. ${t('step3')}` }),
-      jsx(CommandLine, { text: `hermes ${CLI} auto` })
+      jsx('p', { children: `2. ${t('step2')}` })
     ]
   })
 }
@@ -188,7 +177,7 @@ function Panel({ status, t }) {
   const act = async (argv, okMsg, failMsg) => {
     setBusy(true)
     try {
-      const { code, output } = await runCli(argv, argv[0] === 'auto' ? 180 : 60)
+      const { code, output } = await runCli(argv)
       if (code !== 0 || /failed/i.test(output)) throw new Error(output.trim().split('\n').pop() || `exit ${code}`)
       host.notify({ kind: 'success', message: okMsg })
     } catch (err) {
@@ -247,13 +236,6 @@ function Panel({ status, t }) {
       jsxs('div', {
         className: 'flex justify-end gap-1',
         children: [
-          status.state !== 'setup' && status.provider === 'anthropic'
-            ? jsx(Button, {
-                size: 'sm', variant: 'ghost', disabled: busy,
-                onClick: () => act(['auto'], t('autoDone'), (m) => t('autoFailed', m)),
-                children: t('auto')
-              })
-            : null,
           jsx(Button, { size: 'sm', variant: 'ghost', disabled: busy, onClick: refresh, children: t('refresh') })
         ]
       })

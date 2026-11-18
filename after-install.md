@@ -16,8 +16,7 @@ The switcher works on Hermes' own credential pool (`~/.hermes/auth.json`); it ne
    exists, and afterwards the account Hermes uses next (green / amber / red by pool health).
    Click it to switch accounts or copy the commands below.
 
-3. **Switch by hand** with `/switch <label>`, or **rotate by real quota** with `/switch auto`.
-   For unattended rotation run `hermes credential-pool-switcher auto` from cron every 30 minutes.
+3. **Switch by hand** with `/switch <label>` (or click an account in the status bar chip).
 
 Dead logins (✖, refresh token rejected) are replaced with
 `hermes auth remove anthropic '<label>' && hermes auth add anthropic --type oauth --label '<label>'`.

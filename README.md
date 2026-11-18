@@ -1,6 +1,6 @@
 # credential-pool-switcher
 
-A [Hermes Agent](https://hermes-agent.nousresearch.com) plugin that lets you switch between pooled provider accounts — for example between several Claude (Anthropic) logins — from chat, the CLI, or by the agent itself, and rotate them automatically by real quota usage.
+A [Hermes Agent](https://hermes-agent.nousresearch.com) plugin that lets you switch between pooled provider accounts — for example between several Claude (Anthropic) logins — from chat, the CLI, or by the agent itself, .
 
 ## Why
 
@@ -8,9 +8,9 @@ Hermes rotates a *credential pool* per provider: add several OAuth logins (`herm
 
 This plugin adds exactly that:
 
-- **`/switch`** in any chat — `/switch list`, `/switch hendrik@…`, `/switch plan work`, `/switch auto`
-- **Tool `account_switch`** — the agent can list and plan; a real switch or auto rotation is escalated to the human-approval gate (see Security)
-- **CLI `hermes credential-pool-switcher list|switch|plan|auto`**
+- **`/switch`** in any chat — `/switch list`, `/switch hendrik@…`, `/switch plan work`, `/switch setup`
+- **Tool `account_switch`** — the agent can list and plan; a real switch is escalated to the human-approval gate (see Security)
+- **CLI `hermes credential-pool-switcher list|switch|plan|status|setup`**
 
 ## What it does
 
@@ -22,11 +22,11 @@ This plugin adds exactly that:
 
 ## Security
 
-- **Agent-initiated switches require human approval.** Reordering the pool changes which account gets billed first, so the plugin registers a `pre_tool_call` hook that escalates every model-issued `switch` and `auto` (not `list`/`plan`/`dry_run`) to Hermes' approval gate. `/switch` and the CLI are unaffected — they are already user actions.
+- **Agent-initiated switches require human approval.** Reordering the pool changes which account gets billed first, so the plugin registers a `pre_tool_call` hook that escalates every model-issued `switch` (not `list`/`plan`/`dry_run`) to Hermes' approval gate. `/switch` and the CLI are unaffected — they are already user actions.
 - **Tokens are never printed, logged, returned, or written by the plugin.**
-- **Usage percentages** (list + auto) read each pooled OAuth token in-process and send it only to the provider's own API (`api.anthropic.com/api/oauth/usage`). Expiring tokens are refreshed first through the pool's own refresh path, so the rotated single-use refresh token is persisted by Hermes itself.
-- **What touches `auth.json`:** switching re-orders priorities through the pool (like `hermes auth priority`). Auto rotation additionally writes bench state (`last_status`, `last_error_*`) for exhausted logins and clears it for logins that are alive again — under Hermes' auth-store lock and with token-generation bases, so a token refreshed concurrently by another Hermes process is never reverted. Token fields are never modified; dead rows are never touched.
-- The probe (auto, optional) sends one 4-token request per usage-healthy login to `api.anthropic.com/v1/messages`.
+- **Usage percentages** (`/switch list`) go through Hermes' public `agent.account_usage.fetch_account_usage(read_only=True)`: each usable pooled OAuth token is sent to the provider's own API (`api.anthropic.com`) by that helper. Dead and still-benched logins are skipped; nothing is refreshed, rotated or written.
+- **`auth.json`:** the plugin never reads or writes it itself. Switching re-orders priorities through the pool object (`move_entry`, the call behind `hermes auth priority`); everything else is read-only.
+- This catalog build has no automatic rotation. The full build with `auto` (usage-based benching and promotion, unattended cron mode) lives on the repository's `main` branch.
 
 ## Install
 
@@ -54,11 +54,11 @@ Use a recognisable `--label` (e.g. the account's e-mail): it is what `/switch <l
 
 Hermes also seeds the pool automatically from:
 
-| Source | Shows up as | Managed by `auto`? |
-| --- | --- | --- |
-| `hermes auth add … --type oauth` | your label | yes |
-| `ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN` (env or `~/.hermes/.env`) | the variable name | no |
-| Claude Code CLI login (`~/.claude/.credentials.json` / Keychain) | `claude_code` | no |
+| Source | Shows up as |
+| --- | --- |
+| `hermes auth add … --type oauth` | your label |
+| `ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN` (env or `~/.hermes/.env`) | the variable name |
+| Claude Code CLI login (`~/.claude/.credentials.json` / Keychain) | `claude_code` |
 
 **Dead logins** (✖ in `/switch list`, refresh token rejected — e.g. after a
 long idle period) are never used again. Replace them:
@@ -71,9 +71,6 @@ hermes auth add anthropic --type oauth --label 'work@example.com'
 For `claude_code` log in again in the Claude Code CLI; for env entries put a
 fresh token into the variable. `/switch list` prints the right command for
 each dead entry.
-
-**Unattended rotation:** run `hermes credential-pool-switcher auto` from cron
-(e.g. every 30 minutes).
 
 `/switch setup` (or `hermes credential-pool-switcher setup`) prints these steps
 adapted to your current pool.
@@ -90,17 +87,17 @@ the app automatically; enable it once under **Capabilities → Plugins**
   green = all usable, amber = some benched or dead, red = none usable (with the
   time the next one is free).
 - Click it for every account's state; click a usable account to put it first;
-  copy the command to revive a dead login or add another; run auto rotation.
+  copy the command to revive a dead login or add another.
 
 It reads `hermes credential-pool-switcher status --json` — a local snapshot
 without network calls or token refreshes — every 90 s, and refreshes at once
-when a switch or auto run happens inside the gateway.
+when a switch happens inside the gateway.
 
 ## Usage
 
 ```text
 /switch list                    → all accounts, priorities, usage (⛔ = benched, ✖ = dead)
-/switch auto [--dry-run] [--no-probe]  → bench exhausted logins, promote the healthiest
+
 /switch snailberg@              → move that account to the front
 /switch plan snailberg@         → dry-run preview
 /switch list --provider=openai  → other pooled providers (flag works in any position)
@@ -112,7 +109,7 @@ Agent tool:
 {"action": "switch", "target": "hendrik@kaiser-mail.de", "provider": "anthropic"}
 ```
 
-(real switches and `auto` are escalated to human approval; `action: "list"` / `"plan"` run directly)
+(real switches are escalated to human approval; `action: "list"` / `"plan"` run directly)
 
 CLI:
 
@@ -120,25 +117,12 @@ CLI:
 hermes credential-pool-switcher list
 hermes credential-pool-switcher switch '#2'
 hermes credential-pool-switcher plan work
-hermes credential-pool-switcher auto --dry-run
+hermes credential-pool-switcher status
 ```
 
 ## Targets
 
 A target can be `#index`, an exact label, an entry id, or a unique label prefix (`/switch work` matches `work@example.com` if only one label starts with `work`).
-
-## Auto rotation (`auto`)
-
-Anthropic only, manual OAuth logins only.
-
-- Reads Anthropic's own usage endpoint per login: any active `limits[]` entry at 100% / severity `critical` benches that login until its latest `resets_at`.
-- Logins that are already benched with a future reset are answered from the stored bench — no usage call (the endpoint rate-limits per-cycle polling) and no rewrite of the bench.
-- An optional 4-token probe double-checks usage-healthy logins before they get priority 0 (catches org spend caps the usage windows do not show). A 429/402 benches the login (until the "regain access" time, else for one hour); other failures are reported as *inconclusive* and never bench. An unknown probe model falls back to the next one.
-- The login with the most weekly headroom (then 5h headroom, then priority) is promoted to priority 0 — a freshly reset login at 0% wins.
-- A probed-alive login that still carries a bench is unbenched.
-- Dead logins (refresh token rejected) are listed as "log in anew" and left alone.
-
-The tool path is escalated to human approval like `switch`; the CLI (`hermes credential-pool-switcher auto`) is meant for unattended cron runs.
 
 ## Development
 

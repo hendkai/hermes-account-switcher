@@ -2,38 +2,32 @@
 
 Surfaces:
 
-* tool ``account_switch``  — the agent can list/plan; a real switch or an
-  auto rotation is escalated to the human-approval gate by a
-  ``pre_tool_call`` hook
+* tool ``account_switch``  — the agent can list/plan; a real switch is
+  escalated to the human-approval gate by a ``pre_tool_call`` hook
 * slash ``/switch``        — same thing from any chat
-* CLI ``hermes credential-pool-switcher list|switch|plan|auto``
+* CLI ``hermes credential-pool-switcher list|switch|plan|status|setup``
+* desktop status bar chip (``desktop/plugin.js``)
 
 How it touches Hermes:
 
 * **Listing / switching** read the pool through ``agent.credential_pool``
-  (``load_pool`` → ``entries()`` / ``peek()`` / ``move_entry()``) — the same
+  (``load_pool`` -> ``entries()`` / ``peek()`` / ``move_entry()``) — the same
   calls ``hermes auth list`` / ``hermes auth priority`` make. When that
   module is not importable it falls back to running those two CLI commands
   and parsing their output. Switching = "move to priority 0", i.e. that
   account is tried first on the next model call (``fill_first`` strategy).
-* **Usage percentages** (list + auto) read each pooled OAuth token
-  in-process and send it to the provider's own API (api.anthropic.com,
-  ``/api/oauth/usage``). Expiring tokens are refreshed through the pool's own
-  refresh path first so the rotated single-use refresh token is persisted.
-* **Auto rotation** additionally writes bench state (``last_status`` /
-  ``last_error_*``) for exhausted logins into auth.json via
-  ``hermes_cli.auth.write_credential_pool`` — under the auth-store lock and
-  with token-generation bases, so a concurrent token refresh is never
-  overwritten. Token fields are never modified.
+* **Usage percentages** (list only) go through Hermes' public
+  ``agent.account_usage.fetch_account_usage(read_only=True)``: each usable
+  pooled OAuth token is sent to the provider's own API (api.anthropic.com) by
+  that helper. Dead and still-benched logins are skipped; nothing is
+  refreshed, rotated or written.
 
+The plugin never reads or writes auth.json itself and never refreshes tokens.
 Tokens are never printed, logged, returned, or written by this plugin.
-Some of the helpers used are private Hermes APIs; failures to import or call
-them are logged (logger ``credential_pool_switcher``) instead of swallowed.
 """
 
 from __future__ import annotations
 
-import contextlib
 import json
 import logging
 import math
@@ -60,6 +54,8 @@ _ROW = re.compile(
 )
 # Any exhaustion class the core prints ("rate-limited", "billing", "exhausted",
 # ...) ends with a "(<remaining> left)" group while the bench is still running.
+# No reset timestamp stored: the core falls back to a per-error TTL; one hour is its 429 default.
+_EXHAUSTED_FALLBACK_SECONDS = 60 * 60
 _REST_BENCH = re.compile(r"\((?P<left>[^()]*\bleft)\)", re.I)
 
 
@@ -121,16 +117,6 @@ def _fmt_left(seconds: float) -> str:
     parts = [(d, "d"), (h, "h"), (m, "m"), (sec, "s")]
     first = next((i for i, (v, _) in enumerate(parts) if v), 3)
     return " ".join(f"{v}{u}" for v, u in parts[first:first + 2])
-
-
-def _pct(value: Any, default: float = 999.0) -> float:
-    """Utilization for sorting: a real 0 stays 0 — only a missing value sorts last."""
-    if value is None:
-        return default
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
 
 
 def _display_source(source: str) -> str:
@@ -326,12 +312,11 @@ def _pool_strategy(provider: str) -> str:
 def _bench_until(entry) -> Optional[float]:
     if getattr(entry, "last_status", None) != STATUS_EXHAUSTED:
         return None
-    try:
-        from agent.credential_pool import _exhausted_until  # type: ignore  # noqa: SLF001
-        return _exhausted_until(entry)
-    except Exception as exc:
-        log.debug("_exhausted_until unavailable (%s); using last_error_reset_at", exc)
-        return _to_epoch(getattr(entry, "last_error_reset_at", None))
+    reset = _to_epoch(getattr(entry, "last_error_reset_at", None))
+    if reset is not None:
+        return reset
+    at = _to_epoch(getattr(entry, "last_status_at", None))
+    return at + _EXHAUSTED_FALLBACK_SECONDS if at else None
 
 
 def _accounts_from_pool(pool) -> List[Account]:
@@ -379,195 +364,54 @@ def _read_accounts(provider: str) -> Tuple[str, List[Account]]:
     return _parse_list(_run(["auth", "list", provider]))
 
 
-# -- tokens & usage ----------------------------------------------------------------
-
-def _refresh_if_expiring(pool, entry):
-    """Pool-owned OAuth refresh for an expiring/expired entry; the entry itself on any failure."""
-    try:
-        if pool._entry_needs_refresh(entry):  # noqa: SLF001 - same helper the pool uses on select()
-            return pool._refresh_entry(entry, force=False) or entry  # noqa: SLF001
-    except AttributeError as exc:
-        log.warning("pool refresh API changed (%s); usage may 401 for idle logins", exc)
-    except Exception as exc:
-        log.debug("refresh for %s failed: %s", getattr(entry, "label", "?"), exc)
-    return entry
-
-
-def _current_bench_resets(provider: str) -> dict:
-    """{label: reset_at_iso} for rows currently benched (exhausted) with a future reset.
-
-    Lets list/auto skip the usage endpoint entirely for logins whose bench
-    has not expired yet — /api/oauth/usage rate-limits aggressively (429)
-    when polled every cycle for every account.
-    """
-    try:
-        from hermes_cli.auth import read_credential_pool
-    except Exception as exc:
-        log.debug("hermes_cli.auth not importable: %s", exc)
-        return {}
-    now = time.time()
-    out: dict = {}
-    try:
-        for row in read_credential_pool(provider):
-            if not isinstance(row, dict) or row.get("last_status") != STATUS_EXHAUSTED:
-                continue
-            reset = _to_epoch(row.get("last_error_reset_at"))
-            if reset is not None and reset > now:
-                out[str(row.get("label") or row.get("id") or "")] = _iso_utc(reset)
-    except Exception as exc:
-        log.warning("reading bench state for %s failed: %s", provider, exc)
-        return {}
-    return out
-
-
-def _oauth_tokens(
-    provider: str,
-    *,
-    manual_only: bool,
-    labels: Optional[set] = None,
-    cached_benches: Optional[dict] = None,
-) -> Tuple[dict, List[str]]:
-    """``({label: access_token}, [dead labels])`` for the pool's OAuth rows.
-
-    Dead rows (refresh token already rejected) are reported, never refreshed —
-    re-POSTing a rejected refresh token only produces another invalid_grant.
-    Rows that are not benched get an expiring token refreshed through the pool
-    first: a benched login is never used, so Hermes never refreshes it, and by
-    the time its bench expires the access token is long dead (usage 401s).
-    """
-    pool = _load_pool(provider)
-    if pool is None:
-        return {}, []
-    benched = set(cached_benches if cached_benches is not None else _current_bench_resets(provider))
-    tokens: dict = {}
-    dead: List[str] = []
-    try:
-        entries = pool.entries()
-    except Exception as exc:
-        log.warning("pool.entries() failed: %s", exc)
-        return {}, []
-    for e in entries:
-        if getattr(e, "auth_type", "") != "oauth":
-            continue
-        source = str(getattr(e, "source", "") or "")
-        if manual_only and not source.startswith("manual"):
-            continue
-        label = str(getattr(e, "label", "") or e.id)
-        if labels is not None and label not in labels:
-            continue
-        if getattr(e, "last_status", None) == STATUS_DEAD:
-            dead.append(label)
-            continue
-        if label not in benched:
-            e = _refresh_if_expiring(pool, e)
-            if getattr(e, "last_status", None) == STATUS_DEAD:
-                dead.append(label)
-                continue
-        token = (getattr(e, "access_token", "") or "").strip()
-        if token:
-            tokens[label] = token
-    return tokens, dead
-
-
-def _usage_limits(tokens: dict, cached_benches: Optional[dict] = None) -> dict:
-    """Per-login verdict from Anthropic's own usage endpoint.
-
-    ``{label: {"dead_until": iso|None, "active_limits": [...], "week_pct": float,
-    "session_pct": float, "scoped_pct": float, "scoped_active": bool,
-    "cached": bool}}``. A login is dead when any ``limits[]`` entry is active
-    at >=100% / severity critical — the endpoint's own words, no probe needed.
-    ``dead_until`` is the LATEST active limit's reset. Tokens stay in-process.
-    """
-    try:
-        from agent.account_usage import _get_json  # noqa: SLF001
-    except Exception as exc:
-        log.warning("agent.account_usage._get_json not importable: %s", exc)
-        return {label: {"error": "agent.account_usage not importable"} for label in tokens}
-    cached = cached_benches or {}
-    out: dict = {}
-    for label, token in tokens.items():
-        if label in cached:
-            # Still benched with a future reset: no network call.
-            out[label] = {
-                "dead_until": cached[label],
-                "active_limits": ["cached bench"],
-                "week_pct": None,
-                "session_pct": None,
-                "scoped_pct": None,
-                "scoped_active": True,
-                "cached": True,
-            }
-            continue
-        try:
-            payload = _get_json(
-                "https://api.anthropic.com/api/oauth/usage",
-                {"Authorization": f"Bearer {token}",
-                 "anthropic-beta": "oauth-2025-04-20", "User-Agent": "claude-code/2.1.0"},
-                timeout=15.0,
-            )
-        except Exception as exc:
-            out[label] = {"error": f"usage fetch failed: {type(exc).__name__}"}
-            continue
-        dead_until: Optional[str] = None
-        dead_epoch: Optional[float] = None
-        active: list = []
-        scoped_pct = None
-        scoped_active = False
-        for lim in payload.get("limits") or []:
-            if not isinstance(lim, dict) or not lim.get("is_active"):
-                if isinstance(lim, dict) and str(lim.get("kind") or "") == "weekly_scoped":
-                    scoped_pct = lim.get("percent")
-                    scoped_active = False
-                continue
-            pct = lim.get("percent")
-            critical = str(lim.get("severity") or "").lower() == "critical"
-            if str(lim.get("kind") or "") == "weekly_scoped":
-                scoped_pct = pct
-                scoped_active = True
-            if (isinstance(pct, (int, float)) and pct >= 100) or critical:
-                active.append(f"{lim.get('kind')}={pct}%")
-                reset = lim.get("resets_at")
-                reset_epoch = _to_epoch(reset)
-                if reset_epoch is not None and (dead_epoch is None or reset_epoch > dead_epoch):
-                    dead_epoch, dead_until = reset_epoch, str(reset)
-        five = payload.get("five_hour") or {}
-        seven = payload.get("seven_day") or {}
-        out[label] = {
-            "dead_until": dead_until,
-            "active_limits": active,
-            "week_pct": seven.get("utilization"),
-            "session_pct": five.get("utilization"),
-            "scoped_pct": scoped_pct,
-            "scoped_active": scoped_active,
-            "cached": False,
-        }
-    return out
-
+# -- usage (public helper) ---------------------------------------------------------
 
 def _usage_for_accounts(accounts: List[Account], provider: str = DEFAULT_PROVIDER) -> Optional[dict]:
     """Best-effort per-account usage for the list view.
 
-    Same token path as auto rotation: dead rows skipped, benched rows answered
-    from their stored bench (no fetch), expiring tokens refreshed first.
+    Uses Hermes' public ``fetch_account_usage(read_only=True)``: it never
+    refreshes, rotates or benches a pool entry. Dead and still-benched logins
+    are skipped (their token is useless / the endpoint rate-limits), so an
+    expired idle login simply shows no percentages.
     Returns ``{label: {"five_hour": ..., "week": ..., "scoped": {...}}}`` or None.
     """
-    labels = {a.label for a in accounts if a.auth_type == "oauth" and a.status != STATUS_DEAD}
-    if not labels:
+    wanted = {a.label for a in accounts
+              if a.auth_type == "oauth" and a.status != STATUS_DEAD and not _is_benched(a, time.time())}
+    if not wanted:
         return None
-    cached = _current_bench_resets(provider)
-    tokens, _ = _oauth_tokens(provider, manual_only=False, labels=labels, cached_benches=cached)
-    tokens = {k: v for k, v in tokens.items() if k not in cached}
-    if not tokens:
+    try:
+        from agent.account_usage import fetch_account_usage
+    except Exception as exc:
+        log.debug("agent.account_usage not importable: %s", exc)
+        return None
+    pool = _load_pool(provider)
+    if pool is None:
         return None
     out: dict = {}
-    for label, info in _usage_limits(tokens).items():
-        if info.get("error"):
+    for entry in pool.entries():
+        label = str(getattr(entry, "label", "") or "")
+        token = (getattr(entry, "access_token", "") or "").strip()
+        if label not in wanted or getattr(entry, "auth_type", "") != "oauth" or not token:
             continue
-        out[label] = {
-            "five_hour": {"used_percent": info.get("session_pct")},
-            "week": {"used_percent": info.get("week_pct")},
-            "scoped": {"used_percent": info.get("scoped_pct"), "active": info.get("scoped_active")},
-        }
+        try:
+            snap = fetch_account_usage(provider, api_key=token, read_only=True)
+        except Exception as exc:
+            log.debug("usage fetch for %s failed: %s", label, type(exc).__name__)
+            continue
+        if snap is None:
+            continue
+        windows: dict = {}
+        for w in snap.windows:
+            name = str(w.label or "").lower()
+            pct = w.used_percent
+            if getattr(w, "scope", "account") == "model":
+                windows["scoped"] = {"used_percent": pct, "active": bool(pct is not None and pct >= 100)}
+            elif "session" in name:
+                windows["five_hour"] = {"used_percent": pct}
+            elif "week" in name:
+                windows["week"] = {"used_percent": pct}
+        if windows:
+            out[label] = windows
     return out or None
 
 
@@ -757,8 +601,7 @@ def render_setup(status: dict, markdown: bool = False) -> str:
     lines += [
         f"1. Add each Claude account once (opens the browser login): {tick}{_add_hint(provider)}{tick}",
         f"2. Check: {tick}/switch list{tick} — or the status bar chip in the desktop app.",
-        f"3. Pick one by hand: {tick}/switch <label>{tick}; or rotate by real quota: {tick}/switch auto{tick}"
-        f" (unattended: run {tick}hermes {PLUGIN_ID} auto{tick} from cron every 30 min).",
+        f"3. Pick one by hand: {tick}/switch <label>{tick}.",
     ]
     for row in status["accounts"]:
         if row["status"] == "dead":
@@ -845,308 +688,6 @@ def switch(
     return plan
 
 
-# -- utilization-based auto rotation ------------------------------------------
-
-AUTO_BENCH_TAG = "auto-rotation"
-_PROBE_MODEL_DEFAULT = "claude-haiku-5-5"
-# Tried in order when the API does not know a probe model (404 / model error),
-# so a renamed model id degrades to the next one instead of a silent no-op probe.
-_PROBE_MODEL_FALLBACKS = ("claude-haiku-4-5",)
-_PROBE_TIMEOUT_SECONDS = 20
-# A masked 429 body (plain {"error": "Error"}) carries no reset date: bench for
-# an hour so the next auto run re-probes instead of hammering the login.
-_PROBE_BENCH_FALLBACK_SECONDS = 60 * 60
-_RE_GAIN_DATE = re.compile(
-    r"regain access on (\d{4}-\d{2}-\d{2})(?: at (\d{1,2}:\d{2}))?"
-    r"(?:\s*\(?\s*(UTC|GMT|Z|[+-]\d{2}:?\d{2})\b\)?)?",
-    re.I,
-)
-
-
-def _probe_reset_at(status: int, body: str) -> Optional[str]:
-    """ISO reset timestamp for a dead-probe bench, or None for non-benching statuses.
-
-    "regain access on <date> at <HH:MM>" with an explicit zone is taken as is.
-    Without one the zone is ambiguous: take the EARLIER of the UTC and the
-    local reading — unbenching too early costs one re-probe (which re-benches),
-    too late keeps a working login idle for hours.
-    """
-    import datetime
-
-    if status not in (429, 402):
-        return None
-    now = time.time()
-    m = _RE_GAIN_DATE.search(body or "")
-    if m:
-        day, clock, zone = m.group(1), m.group(2) or "00:00", (m.group(3) or "").upper()
-        try:
-            naive = datetime.datetime.strptime(f"{day} {clock}", "%Y-%m-%d %H:%M")
-        except ValueError:
-            naive = None
-        if naive is not None:
-            if zone in ("UTC", "GMT", "Z"):
-                epoch = naive.replace(tzinfo=datetime.timezone.utc).timestamp()
-            elif zone:
-                sign = 1 if zone[0] == "+" else -1
-                digits = zone[1:].replace(":", "")
-                offset = datetime.timedelta(hours=int(digits[:2]), minutes=int(digits[2:4]))
-                epoch = naive.replace(tzinfo=datetime.timezone(sign * offset)).timestamp()
-            else:
-                as_utc = naive.replace(tzinfo=datetime.timezone.utc).timestamp()
-                as_local = naive.timestamp()  # naive → local time
-                epoch = min(as_utc, as_local)
-            if epoch > now:
-                return _iso_utc(epoch)
-    return _iso_utc(now + _PROBE_BENCH_FALLBACK_SECONDS)
-
-
-def _probe_once(label: str, token: str, model: str) -> dict:
-    import json as _json
-    import urllib.error
-    import urllib.request
-
-    req = urllib.request.Request(
-        "https://api.anthropic.com/v1/messages",
-        data=_json.dumps({
-            "model": model, "max_tokens": 4,
-            "messages": [{"role": "user", "content": "ping"}],
-        }).encode(),
-        headers={
-            "authorization": f"Bearer {token}",
-            "anthropic-version": "2023-06-01",
-            # Claude Code identity — OAuth requests are rejected without it.
-            "anthropic-beta": "claude-code-20250219,oauth-2025-04-20",
-            "User-Agent": "claude-code/2.1.74",
-            "content-type": "application/json",
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=_PROBE_TIMEOUT_SECONDS) as resp:
-            return {"label": label, "alive": resp.status == 200, "status": resp.status, "model": model}
-    except urllib.error.HTTPError as ex:
-        body = ex.read().decode("utf-8", "replace")
-        return {
-            "label": label,
-            "alive": False if ex.code in (429, 402) else None,
-            "status": ex.code,
-            "model": model,
-            "reset_at": _probe_reset_at(ex.code, body),
-            "note": body[:160],
-        }
-    except Exception as exc:  # network/timeout: transient, never bench
-        return {"label": label, "alive": None, "status": None, "model": model,
-                "note": f"{type(exc).__name__}: {exc}"[:160]}
-
-
-def _is_model_error(result: dict) -> bool:
-    status = result.get("status")
-    note = str(result.get("note") or "").lower()
-    return status == 404 or (status == 400 and "model" in note)
-
-
-def _probe_anthropic_login(label: str, token: str, model: str) -> dict:
-    """One 4-token /v1/messages probe: can this login serve requests right now?
-
-    ``alive`` is True/False; ``None`` means inconclusive (network/5xx/unknown
-    model) — the login must NOT be benched on that. The token stays
-    in-process, never returned.
-    """
-    models = [model, *[m for m in _PROBE_MODEL_FALLBACKS if m != model]]
-    result: dict = {}
-    for m in models:
-        result = _probe_once(label, token, m)
-        if not _is_model_error(result):
-            return result
-        log.warning("probe model %s rejected (HTTP %s); trying the next one", m, result.get("status"))
-    result["alive"] = None
-    return result
-
-
-def _write_auto_status(provider: str, benched: dict, alive_labels: list) -> tuple:
-    """Bench/clear pool rows in auth.json. Returns ``(error, cleared_labels)``.
-
-    Mirrors what the core's own exhaustion path would persist: for each dead
-    login ``last_status=exhausted`` with the reset timestamp. An ALIVE login
-    still carrying an exhaustion bench is cleared. Read and write happen under
-    the auth-store lock and pass the read token generation as ``token_bases``,
-    so a token refreshed concurrently by another Hermes process is kept, never
-    reverted to the stale one (Anthropic refresh tokens are single-use).
-    """
-    try:
-        from hermes_cli.auth import read_credential_pool, write_credential_pool
-    except Exception as exc:
-        return f"cannot import auth store helpers: {exc}", []
-    try:
-        from hermes_cli.auth import _auth_store_lock  # noqa: SLF001
-        lock = _auth_store_lock(timeout_seconds=45)
-    except Exception as exc:
-        log.warning("auth-store lock unavailable (%s); relying on token_bases only", exc)
-        lock = contextlib.nullcontext()
-
-    cleared: list = []
-    try:
-        with lock:
-            # Annotated as dict upstream, but a provider slice is a list of rows.
-            rows: List[Any] = list(read_credential_pool(provider) or [])  # type: ignore[arg-type]
-            bases = {
-                str(row["id"]): (row.get("access_token"), row.get("refresh_token"))
-                for row in rows if isinstance(row, dict) and row.get("id")
-            }
-            now = time.time()
-            alive = set(alive_labels)
-            cleared_ids: list = []
-            changed = False
-            for row in rows:
-                if not isinstance(row, dict):
-                    continue
-                label = str(row.get("label") or "")
-                if row.get("last_status") == STATUS_DEAD:
-                    continue  # terminal verdict owned by the core; never overwrite
-                if label in benched:
-                    row["last_status"] = STATUS_EXHAUSTED
-                    row["last_status_at"] = now
-                    row["last_error_code"] = benched[label].get("code", 429)
-                    row["last_error_reason"] = "rate_limit_error"
-                    row["last_error_message"] = f"[{AUTO_BENCH_TAG}] {benched[label].get('note', '')}"[:400]
-                    row["last_error_reset_at"] = benched[label]["reset_at"]
-                    changed = True
-                elif label in alive and row.get("last_status") == STATUS_EXHAUSTED:
-                    for key in ("last_status_at", "last_error_code", "last_error_reason",
-                                "last_error_message", "last_error_reset_at"):
-                        row[key] = None
-                    row["last_status"] = "ok"
-                    cleared.append(label)
-                    if row.get("id"):
-                        cleared_ids.append(str(row["id"]))
-                    changed = True
-            if not changed:
-                return None, cleared
-            try:
-                write_credential_pool(provider, rows, status_cleared_ids=cleared_ids or None,
-                                      token_bases=bases)
-            except TypeError:
-                # Older core without token_bases: still safe under the lock above.
-                write_credential_pool(provider, rows, status_cleared_ids=cleared_ids or None)
-    except Exception as exc:
-        return f"write_credential_pool failed: {exc}", cleared
-    return None, cleared
-
-
-def auto_rotate(
-    provider: str = DEFAULT_PROVIDER,
-    *,
-    probe: bool = True,
-    dry_run: bool = False,
-    model: str = _PROBE_MODEL_DEFAULT,
-) -> dict:
-    """Usage-aware rotation: bench dead logins until their reset, promote the
-    account with the most weekly headroom to priority 0.
-
-    This is the reactive complement to Hermes' pool rotation: when the core
-    cannot attribute a 429 to a pool entry (rotated OAuth token), accounts are
-    never benched and every call burns retries on a dead login. The probe is
-    the ground truth; usage windows pick the healthiest survivor.
-    """
-    if provider != DEFAULT_PROVIDER:
-        return {"ok": False, "error": f"auto rotation supports 'anthropic' (got '{provider}')."}
-    cached = _current_bench_resets(provider)
-    tokens, needs_login = _oauth_tokens(provider, manual_only=True, cached_benches=cached)
-    if not tokens and not needs_login:
-        return {"ok": False, "error": (
-            "no OAuth logins added via `hermes auth add` found — auto rotation only manages those. "
-            f"Add each Claude account: {_add_hint(provider)}")}
-    accounts = list_accounts(provider, with_usage=False)
-    managed = [a for a in accounts["accounts"] if a["label"] in tokens and a["auth_type"] == "oauth"]
-    if not managed and not needs_login:
-        return {"ok": False, "error": "pool rows and auth list disagree; nothing to manage."}
-
-    # Ground truth #1: Anthropic's usage endpoint (limits[] with is_active).
-    # Logins with a future-dated bench are answered from the stored bench.
-    usage = _usage_limits(tokens, cached_benches=cached)
-    dead: list = []          # (account, {"reset_at", "why", "cached"})
-    alive: list = []         # usage says alive
-    unknown: list = []       # usage fetch failed → untouched this round
-    for a in managed:
-        info = usage.get(a["label"]) or {}
-        if info.get("error"):
-            unknown.append(a)
-            continue
-        if info.get("dead_until"):
-            dead.append((a, {"reset_at": info["dead_until"],
-                             "why": ", ".join(info["active_limits"]) or "active limit",
-                             "cached": bool(info.get("cached"))}))
-        else:
-            alive.append(a)
-
-    # Ground truth #2 (probe, optional): usage can look healthy while an org
-    # cap still blocks requests — confirm usage-alive logins with one 4-token
-    # call before trusting them with priority 0.
-    probes: dict = {}
-    inconclusive: dict = {}
-    if probe:
-        for a in alive:
-            p = _probe_anthropic_login(a["label"], tokens[a["label"]], model)
-            probes[a["label"]] = p
-            if p.get("alive") is False and p.get("reset_at"):
-                dead.append((a, {"reset_at": p["reset_at"], "why": f"probe HTTP {p.get('status')}",
-                                 "cached": False}))
-            elif p.get("alive") is None:
-                inconclusive[a["label"]] = f"HTTP {p.get('status')}" if p.get("status") else str(p.get("note") or "")[:80]
-    alive = [a for a in alive if a["label"] not in {d[0]["label"] for d in dead}]
-
-    def _week_pct(a: dict) -> float:
-        return _pct((usage.get(a["label"]) or {}).get("week_pct"))
-
-    def _session_pct(a: dict) -> float:
-        return _pct((usage.get(a["label"]) or {}).get("session_pct"))
-
-    # Cached benches are already on disk: re-writing them every cycle would
-    # only replace the original reason with "cached bench".
-    to_bench = {a["label"]: {"reset_at": w["reset_at"], "code": 429, "note": w["why"]}
-                for a, w in dead if not w["cached"]}
-    report = {
-        "ok": True,
-        "dry_run": dry_run,
-        "provider": provider,
-        "strategy": accounts.get("strategy", ""),
-        "probed": len(probes),
-        "alive": [a["label"] for a in alive],
-        "unknown": [a["label"] for a in unknown],
-        "needs_login": list(needs_login),
-        "probe_inconclusive": inconclusive,
-        "dead": {a["label"]: w["reset_at"] for a, w in dead},
-        "dead_why": {a["label"]: w["why"] for a, w in dead},
-        "benched": {k: v["reset_at"] for k, v in to_bench.items()},
-        "cleared": [],
-        "promoted": None,
-        "all_dead": not alive and not unknown,
-    }
-    if dry_run:
-        return report
-
-    error, cleared = _write_auto_status(provider, to_bench, alive_labels=[a["label"] for a in alive])
-    report["cleared"] = cleared
-    if error:
-        report["ok"] = False
-        report["error"] = error
-        return report
-    if to_bench or cleared:
-        _notify_changed(provider)
-
-    if alive:
-        best = sorted(alive, key=lambda a: (_week_pct(a), _session_pct(a), a["priority"]))[0]
-        if best["priority"] != 0:
-            plan = switch(best["label"], provider)
-            report["promoted"] = best["label"] if plan.get("ok") else None
-            if not plan.get("ok"):
-                report["error"] = f"promotion failed: {plan.get('error')}"
-        else:
-            report["promoted"] = best["label"]
-        after = list_accounts(provider, with_usage=False)
-        report["order_after"] = [a["label"] for a in after["accounts"]]
-    return report
-
-
 # -- rendering ---------------------------------------------------------------
 
 def render_list(data: dict, markdown: bool = False) -> str:
@@ -1222,40 +763,6 @@ def render_switch(plan: dict, markdown: bool = False) -> str:
     return "\n".join(lines)
 
 
-def render_auto(data: dict, markdown: bool = False) -> str:
-    b = "**" if markdown else ""
-    if not data.get("ok") and not data.get("provider"):
-        return f"{b}Auto rotation failed{b}: {data.get('error')}"
-    lines = [f"{b}Auto rotation ({data['provider']}){b}" + (" — dry run" if data.get("dry_run") else "")]
-    inconclusive = data.get("probe_inconclusive") or {}
-    for label in data.get("alive", []):
-        extra = f" (probe inconclusive: {inconclusive[label]})" if label in inconclusive else ""
-        lines.append(f"✓ {label} alive{extra}")
-    for label, reset in (data.get("dead") or {}).items():
-        until = reset if isinstance(reset, str) else "unknown reset"
-        why = (data.get("dead_why") or {}).get(label, "")
-        benched = " (benched)" if label in (data.get("benched") or {}) else ""
-        suffix = f" [{why}]" if why else ""
-        lines.append(f"✗ {label} dead until {until}{benched}{suffix}")
-    for label in data.get("cleared", []):
-        lines.append(f"↺ {label} bench lifted (probe alive)")
-    for label in data.get("unknown", []):
-        lines.append(f"? {label} usage unavailable this round (left untouched)")
-    for label in data.get("needs_login", []):
-        lines.append(f"✖ {label} dead — refresh token rejected, log in anew: "
-                     + _relogin_hint(data["provider"], label, "manual"))
-    if data.get("all_dead"):
-        lines.append("All managed logins exhausted — provider fails over elsewhere.")
-    elif data.get("promoted"):
-        lines.append(f"● priority 0 → {data['promoted']}")
-    note = _strategy_note(data["provider"], data.get("strategy") or "")
-    if note:
-        lines.append(f"⚠ {note}")
-    if data.get("error"):
-        lines.append(f"⚠ {data['error']}")
-    return "\n".join(lines)
-
-
 # -- plugin surfaces ----------------------------------------------------------
 
 def _on_pre_tool_call(tool_name: str = "", args: Optional[dict] = None, **_: Any) -> Optional[dict]:
@@ -1284,16 +791,6 @@ def _on_pre_tool_call(tool_name: str = "", args: Optional[dict] = None, **_: Any
                     "(changes which account is tried/billed first)."
                 ),
             }
-        if args.get("action") == "auto":
-            return {
-                "action": "approve",
-                "message": (
-                    "account_switch: auto-rotate the "
-                    f"{args.get('provider') or DEFAULT_PROVIDER} credential pool "
-                    "(benches exhausted logins, promotes the healthiest to "
-                    "priority 0 — changes which account is tried/billed first)."
-                ),
-            }
         return None
     except Exception:
         return None
@@ -1312,7 +809,6 @@ def _tool_account_switch(args: dict, **_: Any) -> str:
     target = str(args.get("target") or "")
     provider = str(args.get("provider") or DEFAULT_PROVIDER) or DEFAULT_PROVIDER
     dry_run = bool(args.get("dry_run", False))
-    probe = bool(args.get("probe", True))
     result: dict
     if action == "list" or (action == "switch" and not target):
         result = list_accounts(provider)
@@ -1321,12 +817,10 @@ def _tool_account_switch(args: dict, **_: Any) -> str:
             result = {"ok": False, "error": "plan needs a target (#index, label, id, or unique prefix)."}
         else:
             result = switch(target, provider, dry_run=True)
-    elif action == "auto":
-        result = auto_rotate(provider, probe=probe, dry_run=dry_run)
     elif action == "switch":
         result = switch(target, provider, dry_run=dry_run)
     else:
-        result = {"ok": False, "error": f"Unknown action '{action}'. Use list, switch, plan, or auto."}
+        result = {"ok": False, "error": f"Unknown action '{action}'. Use list, switch, or plan."}
     return json.dumps(result, default=str)
 
 
@@ -1341,10 +835,6 @@ def _setup_argparse(p) -> None:
     pl = sub.add_parser("plan", help="show what a switch would do")
     pl.add_argument("target")
     pl.add_argument("--provider", default=DEFAULT_PROVIDER)
-    au = sub.add_parser("auto", help="probe logins, bench dead ones, promote the healthiest")
-    au.add_argument("--provider", default=DEFAULT_PROVIDER)
-    au.add_argument("--no-probe", action="store_true", help="reorder by usage windows only, no test call")
-    au.add_argument("--dry-run", action="store_true")
     st = sub.add_parser("status", help="pool snapshot for status indicators (no network)")
     st.add_argument("--provider", default=DEFAULT_PROVIDER)
     st.add_argument("--json", action="store_true", help=f"one '{STATUS_LINE_PREFIX.strip()} <json>' line")
@@ -1365,12 +855,6 @@ def _handle_cli(args) -> None:
         print(render_switch(switch(args.target, _arg(args, "provider", DEFAULT_PROVIDER), dry_run=True)))
     elif cmd == "switch":
         print(render_switch(switch(args.target, _arg(args, "provider", DEFAULT_PROVIDER), dry_run=_arg(args, "dry_run", False))))
-    elif cmd == "auto":
-        print(render_auto(auto_rotate(
-            _arg(args, "provider", DEFAULT_PROVIDER),
-            probe=not _arg(args, "no_probe", False),
-            dry_run=_arg(args, "dry_run", False),
-        )))
     elif cmd == "status":
         status = pool_status(_arg(args, "provider", DEFAULT_PROVIDER))
         if _arg(args, "json", False):
@@ -1384,7 +868,7 @@ def _handle_cli(args) -> None:
 
 
 _SLASH_USAGE = (
-    "Usage: /switch [list] · /switch setup · /switch auto [--dry-run] [--no-probe] · "
+    "Usage: /switch [list] · /switch setup · "
     "/switch <label> · /switch plan <label> · --provider=<id>\n"
     "Accounts live in Hermes' credential pool (~/.hermes/auth.json). Add one: "
     "hermes auth add anthropic --type oauth --label <name>"
@@ -1407,9 +891,6 @@ def _slash(arg: str = "", **_: Any) -> str:
         return _SLASH_USAGE
     if parts[0] in {"setup", "onboarding"}:
         return render_setup(pool_status(provider), markdown=True)
-    if parts[0] == "auto":
-        return render_auto(auto_rotate(provider, probe="--no-probe" not in parts,
-                                       dry_run="--dry-run" in parts), markdown=True)
     if parts[0] == "plan":
         if len(parts) < 2:
             return _SLASH_USAGE
@@ -1433,8 +914,8 @@ def register(ctx) -> None:
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["list", "switch", "plan", "auto"],
-                        "description": "list = show all pooled accounts; switch = move target to priority 0; plan = dry-run preview; auto = probe logins and rotate by real utilization",
+                        "enum": ["list", "switch", "plan"],
+                        "description": "list = show all pooled accounts; switch = move target to priority 0; plan = dry-run preview",
                         "default": "switch",
                     },
                     "target": {
@@ -1447,11 +928,6 @@ def register(ctx) -> None:
                         "default": "anthropic",
                     },
                     "dry_run": {"type": "boolean", "default": False},
-                    "probe": {
-                        "type": "boolean",
-                        "default": True,
-                        "description": "for action=auto: send a 4-token test request per login (ground truth) instead of trusting usage windows only",
-                    },
                 },
             },
         },
@@ -1462,9 +938,7 @@ def register(ctx) -> None:
             "accounts with priorities, bench and dead state; action=switch moves "
             "the target account to the front of the rotation (escalated to human "
             "approval — it changes which account is billed first); action=plan "
-            "previews the switch; action=auto benches exhausted logins until "
-            "their reset and promotes the account with the most quota headroom "
-            "(also escalated; the CLI runs it unattended). This tool never creates "
+            "previews the switch. This tool never creates "
             "accounts: they live in Hermes' credential pool (~/.hermes/auth.json) and "
             "the user adds one with `hermes auth add <provider> --type oauth --label <name>` "
             "(browser login); dead logins are replaced with `hermes auth remove` + `add`."
@@ -1479,6 +953,6 @@ def register(ctx) -> None:
     ctx.register_command(
         "switch",
         handler=_slash,
-        description="Switch pooled accounts (/switch list, /switch setup, /switch <label>, /switch auto)",
-        args_hint="[list|setup|auto|<label>|plan <label>] [--provider=<id>]",
+        description="Switch pooled accounts (/switch list, /switch setup, /switch <label>)",
+        args_hint="[list|setup|<label>|plan <label>] [--provider=<id>]",
     )
