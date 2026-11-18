@@ -589,6 +589,7 @@ def list_accounts(provider: str = DEFAULT_PROVIDER, with_usage: bool = True) -> 
                 "auth_type": a.auth_type,
                 "id": a.id,
                 "priority": a.priority,
+                "source": a.source,
                 "current": a.current,
                 "status": a.status,
                 "needs_login": a.status == STATUS_DEAD,
@@ -615,13 +616,27 @@ def _find(accounts: List[Account], target: str) -> Optional[Account]:
     return prefix[0] if len(prefix) == 1 else None
 
 
+def _add_hint(provider: str) -> str:
+    return f"hermes auth add {provider} --type oauth --label <name>"
+
+
+def _relogin_hint(provider: str, label: str, source: str) -> str:
+    """How to replace a dead login, by where the credential comes from."""
+    if source == "claude_code":
+        return "log in again in the Claude Code CLI (`claude` → /login); Hermes re-reads it automatically"
+    if source.startswith("env:"):
+        return f"put a fresh token into {source[4:]} (e.g. ~/.hermes/.env)"
+    return (f"hermes auth remove {provider} '{label}' && "
+            f"hermes auth add {provider} --type oauth --label '{label}'")
+
+
 def _switch_blocker(account: Account, provider: str = DEFAULT_PROVIDER) -> Optional[str]:
     """Refuse switches that would point Hermes at a dead entry."""
     if account.status == STATUS_DEAD:
         return (
             f"Entry {account.safe_label} is dead (its refresh token was rejected); "
             "Hermes never uses it again, whatever its priority. Log in anew: "
-            f"hermes auth add {provider} --type oauth"
+            + _relogin_hint(provider, account.safe_label, account.source)
         )
     if account.auth_type == "api_key" and account.source.startswith("env:"):
         env_name = account.source[4:]
@@ -670,7 +685,8 @@ def switch(
     """
     _, accounts = _read_accounts(provider)
     if not accounts:
-        return {"ok": False, "error": f"No credentials found for provider '{provider}'."}
+        return {"ok": False, "error": f"No credentials found for provider '{provider}'. "
+                                      f"Add an account: {_add_hint(provider)}"}
     account = _find(accounts, target)
     if account is None:
         return {
@@ -925,7 +941,9 @@ def auto_rotate(
     cached = _current_bench_resets(provider)
     tokens, needs_login = _oauth_tokens(provider, manual_only=True, cached_benches=cached)
     if not tokens and not needs_login:
-        return {"ok": False, "error": "no manual OAuth logins with tokens found (source install required)."}
+        return {"ok": False, "error": (
+            "no OAuth logins added via `hermes auth add` found — auto rotation only manages those. "
+            f"Add each Claude account: {_add_hint(provider)}")}
     accounts = list_accounts(provider, with_usage=False)
     managed = [a for a in accounts["accounts"] if a["label"] in tokens and a["auth_type"] == "oauth"]
     if not managed and not needs_login:
@@ -1021,6 +1039,15 @@ def auto_rotate(
 def render_list(data: dict, markdown: bool = False) -> str:
     b = "**" if markdown else ""
     lines = [f"{b}Accounts ({data['provider']}){b}"]
+    if not data["accounts"]:
+        lines.append(f"No accounts in the {data['provider']} pool yet. Add one (opens the provider's "
+                     f"login in the browser): {_add_hint(data['provider'])}")
+        return "\n".join(lines)
+    relogin: List[str] = []
+    for a in data["accounts"]:
+        if a.get("needs_login") or a.get("status") == STATUS_DEAD:
+            relogin.append(f"  {a['label']}: "
+                           + _relogin_hint(data["provider"], a["label"], str(a.get("source") or "")))
     for a in data["accounts"]:
         benched = a.get("benched")
         dead = a.get("needs_login") or a.get("status") == STATUS_DEAD
@@ -1048,6 +1075,10 @@ def render_list(data: dict, markdown: bool = False) -> str:
     lines.append("● = current entry marker · priority 0 is tried first · ⛔ = benched (exhausted)"
                  " · ✖ = dead (log in anew)"
                  + ("" if data.get("usage_available") else " · usage % unavailable"))
+    if relogin:
+        lines.append("To revive dead logins:")
+        lines.extend(relogin)
+    lines.append(f"More accounts: {_add_hint(data['provider'])} (stored in Hermes' auth.json)")
     note = _strategy_note(data["provider"], data.get("strategy") or "")
     if note:
         lines.append(f"⚠ {note}")
@@ -1098,7 +1129,8 @@ def render_auto(data: dict, markdown: bool = False) -> str:
     for label in data.get("unknown", []):
         lines.append(f"? {label} usage unavailable this round (left untouched)")
     for label in data.get("needs_login", []):
-        lines.append(f"✖ {label} dead — refresh token rejected, log in anew")
+        lines.append(f"✖ {label} dead — refresh token rejected, log in anew: "
+                     + _relogin_hint(data["provider"], label, "manual"))
     if data.get("all_dead"):
         lines.append("All managed logins exhausted — provider fails over elsewhere.")
     elif data.get("promoted"):
@@ -1225,7 +1257,9 @@ def _handle_cli(args) -> None:
 
 _SLASH_USAGE = (
     "Usage: /switch [list] · /switch auto [--dry-run] [--no-probe] · "
-    "/switch <label> · /switch plan <label> · --provider=<id>"
+    "/switch <label> · /switch plan <label> · --provider=<id>\n"
+    "Accounts live in Hermes' credential pool (~/.hermes/auth.json). Add one: "
+    "hermes auth add anthropic --type oauth --label <name>"
 )
 
 
@@ -1300,7 +1334,10 @@ def register(ctx) -> None:
             "approval — it changes which account is billed first); action=plan "
             "previews the switch; action=auto benches exhausted logins until "
             "their reset and promotes the account with the most quota headroom "
-            "(also escalated; the CLI runs it unattended)."
+            "(also escalated; the CLI runs it unattended). This tool never creates "
+            "accounts: they live in Hermes' credential pool (~/.hermes/auth.json) and "
+            "the user adds one with `hermes auth add <provider> --type oauth --label <name>` "
+            "(browser login); dead logins are replaced with `hermes auth remove` + `add`."
         ),
     )
     ctx.register_cli_command(

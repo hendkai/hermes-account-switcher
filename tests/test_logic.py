@@ -322,6 +322,28 @@ def test_oauth_tokens_skips_dead_and_refreshes_only_unbenched(mod, monkeypatch):
     assert refreshed == ["a@x"]
 
 
+# -- onboarding hints --------------------------------------------------------------------
+
+def test_empty_pool_explains_how_to_add_accounts(mod, monkeypatch):
+    text = mod.render_list({"provider": "anthropic", "accounts": []})
+    assert "hermes auth add anthropic --type oauth" in text
+    monkeypatch.setattr(mod, "_read_accounts", lambda p: (p, []))
+    assert "hermes auth add anthropic" in mod.switch("x")["error"]
+
+
+def test_dead_logins_get_source_specific_relogin_hint(mod):
+    data = {"provider": "anthropic", "accounts": [
+        {"index": 1, "label": "a@x", "priority": 0, "current": False, "status": "dead",
+         "needs_login": True, "source": "hermes_pkce"},
+        {"index": 2, "label": "claude_code", "priority": 1, "current": False, "status": "dead",
+         "needs_login": True, "source": "claude_code"},
+    ]}
+    text = mod.render_list(data)
+    assert "hermes auth remove anthropic 'a@x' && hermes auth add anthropic --type oauth --label 'a@x'" in text
+    assert "Claude Code CLI" in text
+    assert "auth.json" in text
+
+
 # -- slash -------------------------------------------------------------------------------
 
 def test_slash_plan_without_target_shows_usage(mod, monkeypatch):

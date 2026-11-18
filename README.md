@@ -36,6 +36,45 @@ hermes plugins install hendkai/hermes-account-switcher
 
 or clone into `~/.hermes/plugins/credential-pool-switcher` and `hermes plugins enable credential-pool-switcher`.
 
+## Adding your accounts
+
+The plugin never creates or stores accounts itself. It works on Hermes' own
+**credential pool**, which lives in `~/.hermes/auth.json` (per profile:
+`~/.hermes/profiles/<name>/auth.json`).
+
+Add each Claude account once — this opens Anthropic's login in the browser:
+
+```bash
+hermes auth add anthropic --type oauth --label work@example.com
+hermes auth add anthropic --type oauth --label private@example.com --priority 0   # tried first
+hermes auth list anthropic                                                       # check
+```
+
+Use a recognisable `--label` (e.g. the account's e-mail): it is what `/switch <label>` matches.
+
+Hermes also seeds the pool automatically from:
+
+| Source | Shows up as | Managed by `auto`? |
+| --- | --- | --- |
+| `hermes auth add … --type oauth` | your label | yes |
+| `ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN` (env or `~/.hermes/.env`) | the variable name | no |
+| Claude Code CLI login (`~/.claude/.credentials.json` / Keychain) | `claude_code` | no |
+
+**Dead logins** (✖ in `/switch list`, refresh token rejected — e.g. after a
+long idle period) are never used again. Replace them:
+
+```bash
+hermes auth remove anthropic 'work@example.com'
+hermes auth add anthropic --type oauth --label 'work@example.com'
+```
+
+For `claude_code` log in again in the Claude Code CLI; for env entries put a
+fresh token into the variable. `/switch list` prints the right command for
+each dead entry.
+
+**Unattended rotation:** run `hermes credential-pool-switcher auto` from cron
+(e.g. every 30 minutes).
+
 ## Usage
 
 ```text
