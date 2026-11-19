@@ -2,10 +2,11 @@
 
 Surfaces:
 
-* tool ``account_switch``  — the agent can list/plan; a real switch is
-  escalated to the human-approval gate by a ``pre_tool_call`` hook
+* tool ``account_switch``  — the agent can list/plan; a real switch or an
+  auto rotation is escalated to the human-approval gate by a
+  ``pre_tool_call`` hook
 * slash ``/switch``        — same thing from any chat
-* CLI ``hermes credential-pool-switcher list|switch|plan|status|setup``
+* CLI ``hermes credential-pool-switcher list|switch|plan|auto|status|setup``
 * desktop status bar chip (``desktop/plugin.js``)
 
 How it touches Hermes:
@@ -21,6 +22,9 @@ How it touches Hermes:
   pooled OAuth token is sent to the provider's own API (api.anthropic.com) by
   that helper. Dead and still-benched logins are skipped; nothing is
   refreshed, rotated or written.
+* **Auto rotation** (``auto``) uses the same usage data and ``switch`` (the
+  pool's ``move_entry``) to promote the login with the most headroom. It does
+  not bench logins: Hermes' own pool handles 429s.
 
 The plugin never reads or writes auth.json itself and never refreshes tokens.
 Tokens are never printed, logged, returned, or written by this plugin.
@@ -121,6 +125,16 @@ def _fmt_left(seconds: float) -> str:
 
 def _display_source(source: str) -> str:
     return source.split(":", 1)[1] if source.startswith("manual:") else source
+
+
+def _pct(value: Any, default: float = 999.0) -> float:
+    """Utilization for sorting: a real 0 stays 0 — only a missing value sorts last."""
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 # -- subprocess fallback ---------------------------------------------------------
@@ -532,8 +546,11 @@ def _is_benched(account: Account, now: float) -> bool:
     return bool(account.notes)  # CLI fallback: only "(… left)" is known
 
 
-def pool_status(provider: str = DEFAULT_PROVIDER) -> dict:
-    """Cheap snapshot for status indicators: no usage fetch, no token refresh, no network.
+def pool_status(provider: str = DEFAULT_PROVIDER, with_usage: bool = False) -> dict:
+    """Snapshot for status indicators.
+
+    Default: no usage fetch, no token refresh, no network. ``with_usage`` adds
+    each login's 5h/week windows (one read-only usage call per usable login).
 
     ``state``: ``setup`` (no accounts yet), ``ok`` (all usable), ``degraded``
     (some benched/dead, at least one usable), ``exhausted`` (none usable).
@@ -543,6 +560,7 @@ def pool_status(provider: str = DEFAULT_PROVIDER) -> dict:
     provider_found, accounts = _read_accounts(provider)
     provider = provider_found or provider
     now = time.time()
+    usage = _usage_for_accounts(accounts, provider) if (with_usage and provider == DEFAULT_PROVIDER) else None
     usable = [a for a in accounts if a.status != STATUS_DEAD and not _is_benched(a, now)]
     active = min(usable, key=lambda a: a.priority) if usable else None
     benched_until = [a.bench_until for a in accounts if a.bench_until and a.bench_until > now]
@@ -572,6 +590,7 @@ def pool_status(provider: str = DEFAULT_PROVIDER) -> dict:
             "switchable": (status == "ok" and _switch_blocker(a, provider) is None
                            and not (active is not None and a.id == active.id)),
             "relogin_hint": _relogin_hint(provider, a.label, a.source) if status == "dead" else None,
+            "usage": (usage or {}).get(a.label) if usage else None,
         })
     return {
         "provider": provider,
@@ -580,6 +599,7 @@ def pool_status(provider: str = DEFAULT_PROVIDER) -> dict:
         "strategy_note": _strategy_note(provider, _pool_strategy(provider)),
         "count": len(accounts),
         "usable": len(usable),
+        "usage_available": bool(usage),
         "active": next((r for r in rows if r["active"]), None),
         "next_ready_at": _iso_utc(min(benched_until)) if benched_until else None,
         "add_hint": _add_hint(provider),
@@ -601,7 +621,8 @@ def render_setup(status: dict, markdown: bool = False) -> str:
     lines += [
         f"1. Add each Claude account once (opens the browser login): {tick}{_add_hint(provider)}{tick}",
         f"2. Check: {tick}/switch list{tick} — or the status bar chip in the desktop app.",
-        f"3. Pick one by hand: {tick}/switch <label>{tick}.",
+        f"3. Pick one by hand: {tick}/switch <label>{tick}; or rotate by real quota: {tick}/switch auto{tick}"
+        f" (unattended: run {tick}hermes {PLUGIN_ID} auto{tick} from cron every 30 min).",
     ]
     for row in status["accounts"]:
         if row["status"] == "dead":
@@ -688,6 +709,77 @@ def switch(
     return plan
 
 
+# -- usage-based auto rotation (read-only) -----------------------------------------
+
+def _exhausted(info: dict) -> bool:
+    """A login is out when its 5h or week window is at 100% or a model-scoped limit is active."""
+    for key in ("five_hour", "week"):
+        pct = (info.get(key) or {}).get("used_percent")
+        if isinstance(pct, (int, float)) and pct >= 100:
+            return True
+    return bool((info.get("scoped") or {}).get("active"))
+
+
+def _window_pct(info: dict, key: str) -> float:
+    return _pct((info.get(key) or {}).get("used_percent"))
+
+
+def auto_rotate(provider: str = DEFAULT_PROVIDER, *, dry_run: bool = False) -> dict:
+    """Usage-based rotation: move the login with the most headroom to priority 0.
+
+    Reads usage through the public helper and reorders with :func:`switch`
+    (the pool's ``move_entry``). It never benches, refreshes or writes tokens:
+    a login Hermes' own pool benched after a 429 is only skipped here.
+    """
+    if provider != DEFAULT_PROVIDER:
+        return {"ok": False, "error": f"auto rotation supports 'anthropic' (got '{provider}')."}
+    _, accounts = _read_accounts(provider)
+    if not accounts:
+        return {"ok": False, "error": f"No credentials found for provider '{provider}'. "
+                                      f"Add an account: {_add_hint(provider)}"}
+    usage = _usage_for_accounts(accounts, provider) or {}
+    now = time.time()
+    report: dict = {
+        "ok": True, "dry_run": dry_run, "provider": provider,
+        "alive": [], "exhausted": [], "benched": [], "dead": [], "unknown": [], "relogin": {},
+        "promoted": None, "would_promote": None, "order_after": None,
+    }
+    candidates: List[Account] = []
+    for a in accounts:
+        if a.auth_type != "oauth":
+            continue  # api keys are not part of rotation
+        if a.status == STATUS_DEAD:
+            report["dead"].append(a.label)
+            report["relogin"][a.label] = _relogin_hint(provider, a.label, a.source)
+        elif _is_benched(a, now):
+            report["benched"].append(a.label)
+        elif a.label not in usage:
+            report["unknown"].append(a.label)
+        elif _exhausted(usage[a.label]):
+            report["exhausted"].append(a.label)
+        else:
+            report["alive"].append(a.label)
+            candidates.append(a)
+
+    if candidates:
+        best = min(candidates, key=lambda a: (
+            _window_pct(usage[a.label], "week"), _window_pct(usage[a.label], "five_hour"), a.priority))
+        if best.priority == 0:
+            report["promoted"] = best.label  # already first
+        elif dry_run:
+            report["would_promote"] = best.label
+        else:
+            plan = switch(best.id, provider)
+            if plan.get("ok"):
+                report["promoted"] = best.label
+                after = list_accounts(provider, with_usage=False)
+                report["order_after"] = [a["label"] for a in after["accounts"]]
+            else:
+                report["ok"] = False
+                report["error"] = f"promotion failed: {plan.get('error')}"
+    return report
+
+
 # -- rendering ---------------------------------------------------------------
 
 def render_list(data: dict, markdown: bool = False) -> str:
@@ -763,6 +855,34 @@ def render_switch(plan: dict, markdown: bool = False) -> str:
     return "\n".join(lines)
 
 
+def render_auto(data: dict, markdown: bool = False) -> str:
+    b = "**" if markdown else ""
+    if not data.get("ok") and not data.get("provider"):
+        return f"{b}Auto rotation failed{b}: {data.get('error')}"
+    lines = [f"{b}Auto rotation ({data['provider']}){b}" + (" — dry run" if data.get("dry_run") else "")]
+    for label in data["alive"]:
+        lines.append(f"✓ {label} has headroom")
+    for label in data["exhausted"]:
+        lines.append(f"⛔ {label} exhausted (5h or week at 100%)")
+    for label in data["benched"]:
+        lines.append(f"⛔ {label} benched by Hermes until its reset")
+    for label in data["unknown"]:
+        lines.append(f"? {label} usage unavailable this round (left untouched)")
+    for label in data["dead"]:
+        lines.append(f"✖ {label} dead — log in anew: " + data.get("relogin", {}).get(label, ""))
+    if data.get("promoted"):
+        lines.append(f"● priority 0 → {data['promoted']}")
+        if data.get("order_after"):
+            lines.append("New order: " + " → ".join(data["order_after"]))
+    elif data.get("would_promote"):
+        lines.append(f"Would move {data['would_promote']} to priority 0")
+    elif data.get("ok") and not data["alive"]:
+        lines.append("No login has headroom right now — order unchanged.")
+    if data.get("error"):
+        lines.append(f"⚠ {data['error']}")
+    return "\n".join(lines)
+
+
 # -- plugin surfaces ----------------------------------------------------------
 
 def _on_pre_tool_call(tool_name: str = "", args: Optional[dict] = None, **_: Any) -> Optional[dict]:
@@ -791,13 +911,23 @@ def _on_pre_tool_call(tool_name: str = "", args: Optional[dict] = None, **_: Any
                     "(changes which account is tried/billed first)."
                 ),
             }
+        if args.get("action") == "auto":
+            return {
+                "action": "approve",
+                "message": (
+                    "account_switch: auto-rotate the "
+                    f"{args.get('provider') or DEFAULT_PROVIDER} credential pool "
+                    "(promotes the login with the most quota headroom to priority 0 — "
+                    "changes which account is tried/billed first)."
+                ),
+            }
         return None
     except Exception:
         return None
 
 
 def _tool_account_switch(args: dict, **_: Any) -> str:
-    """Tool: list pooled accounts or switch the active one.
+    """Tool: list pooled accounts, switch the active one, plan, or auto-rotate.
 
     Hermes dispatches plugin handlers as ``handler(args, **kwargs)`` — the
     whole argument dict arrives positionally, so take the dict and read the
@@ -819,8 +949,10 @@ def _tool_account_switch(args: dict, **_: Any) -> str:
             result = switch(target, provider, dry_run=True)
     elif action == "switch":
         result = switch(target, provider, dry_run=dry_run)
+    elif action == "auto":
+        result = auto_rotate(provider, dry_run=dry_run)
     else:
-        result = {"ok": False, "error": f"Unknown action '{action}'. Use list, switch, or plan."}
+        result = {"ok": False, "error": f"Unknown action '{action}'. Use list, switch, plan, or auto."}
     return json.dumps(result, default=str)
 
 
@@ -835,9 +967,13 @@ def _setup_argparse(p) -> None:
     pl = sub.add_parser("plan", help="show what a switch would do")
     pl.add_argument("target")
     pl.add_argument("--provider", default=DEFAULT_PROVIDER)
-    st = sub.add_parser("status", help="pool snapshot for status indicators (no network)")
+    st = sub.add_parser("status", help="pool snapshot for status indicators (no network unless --usage)")
     st.add_argument("--provider", default=DEFAULT_PROVIDER)
     st.add_argument("--json", action="store_true", help=f"one '{STATUS_LINE_PREFIX.strip()} <json>' line")
+    st.add_argument("--usage", action="store_true", help="add each login's 5h/week usage (one read-only call per login)")
+    au = sub.add_parser("auto", help="move the login with the most usage headroom to priority 0")
+    au.add_argument("--provider", default=DEFAULT_PROVIDER)
+    au.add_argument("--dry-run", action="store_true")
     se = sub.add_parser("setup", help="how to add accounts and what to do next")
     se.add_argument("--provider", default=DEFAULT_PROVIDER)
 
@@ -855,8 +991,11 @@ def _handle_cli(args) -> None:
         print(render_switch(switch(args.target, _arg(args, "provider", DEFAULT_PROVIDER), dry_run=True)))
     elif cmd == "switch":
         print(render_switch(switch(args.target, _arg(args, "provider", DEFAULT_PROVIDER), dry_run=_arg(args, "dry_run", False))))
+    elif cmd == "auto":
+        print(render_auto(auto_rotate(_arg(args, "provider", DEFAULT_PROVIDER),
+                                      dry_run=_arg(args, "dry_run", False))))
     elif cmd == "status":
-        status = pool_status(_arg(args, "provider", DEFAULT_PROVIDER))
+        status = pool_status(_arg(args, "provider", DEFAULT_PROVIDER), with_usage=_arg(args, "usage", False))
         if _arg(args, "json", False):
             print(STATUS_LINE_PREFIX + json.dumps(status, default=str))
         else:
@@ -868,7 +1007,7 @@ def _handle_cli(args) -> None:
 
 
 _SLASH_USAGE = (
-    "Usage: /switch [list] · /switch setup · "
+    "Usage: /switch [list] · /switch setup · /switch auto [--dry-run] · "
     "/switch <label> · /switch plan <label> · --provider=<id>\n"
     "Accounts live in Hermes' credential pool (~/.hermes/auth.json). Add one: "
     "hermes auth add anthropic --type oauth --label <name>"
@@ -891,6 +1030,8 @@ def _slash(arg: str = "", **_: Any) -> str:
         return _SLASH_USAGE
     if parts[0] in {"setup", "onboarding"}:
         return render_setup(pool_status(provider), markdown=True)
+    if parts[0] == "auto":
+        return render_auto(auto_rotate(provider, dry_run="--dry-run" in parts), markdown=True)
     if parts[0] == "plan":
         if len(parts) < 2:
             return _SLASH_USAGE
@@ -914,8 +1055,8 @@ def register(ctx) -> None:
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["list", "switch", "plan"],
-                        "description": "list = show all pooled accounts; switch = move target to priority 0; plan = dry-run preview",
+                        "enum": ["list", "switch", "plan", "auto"],
+                        "description": "list = show all pooled accounts; switch = move target to priority 0; plan = dry-run preview; auto = promote the login with the most usage headroom",
                         "default": "switch",
                     },
                     "target": {
@@ -938,7 +1079,8 @@ def register(ctx) -> None:
             "accounts with priorities, bench and dead state; action=switch moves "
             "the target account to the front of the rotation (escalated to human "
             "approval — it changes which account is billed first); action=plan "
-            "previews the switch. This tool never creates "
+            "previews the switch; action=auto promotes the login with the most quota "
+            "headroom (also escalated; the CLI runs it unattended). This tool never creates "
             "accounts: they live in Hermes' credential pool (~/.hermes/auth.json) and "
             "the user adds one with `hermes auth add <provider> --type oauth --label <name>` "
             "(browser login); dead logins are replaced with `hermes auth remove` + `add`."
@@ -953,6 +1095,6 @@ def register(ctx) -> None:
     ctx.register_command(
         "switch",
         handler=_slash,
-        description="Switch pooled accounts (/switch list, /switch setup, /switch <label>)",
-        args_hint="[list|setup|<label>|plan <label>] [--provider=<id>]",
+        description="Switch pooled accounts (/switch list, /switch setup, /switch auto, /switch <label>)",
+        args_hint="[list|setup|auto [--dry-run]|<label>|plan <label>] [--provider=<id>]",
     )

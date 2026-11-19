@@ -14,9 +14,10 @@ The switcher works on Hermes' own credential pool (`~/.hermes/auth.json`); it ne
    In the desktop app, enable the plugin's desktop half once under **Capabilities → Plugins**:
    a status bar chip (bottom right) then shows "Set up Claude accounts" until the first account
    exists, and afterwards the account Hermes uses next (green / amber / red by pool health).
-   Click it to switch accounts or copy the commands below.
+   Click it to see the 5h and weekly usage bars, switch accounts, or copy the commands below.
 
-3. **Switch by hand** with `/switch <label>` (or click an account in the status bar chip).
+3. **Switch by hand** with `/switch <label>` (or click an account in the status bar chip), or **rotate by real quota** with `/switch auto`.
+   For unattended rotation run `hermes credential-pool-switcher auto` from cron every 30 minutes.
 
 Dead logins (✖, refresh token rejected) are replaced with
 `hermes auth remove anthropic '<label>' && hermes auth add anthropic --type oauth --label '<label>'`.

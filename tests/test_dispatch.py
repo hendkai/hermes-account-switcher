@@ -86,6 +86,10 @@ def plugin(monkeypatch):
             "ok": True, "moved": target, "provider": provider, "dry_run": dry_run,
         },
     )
+    monkeypatch.setattr(
+        mod, "auto_rotate",
+        lambda provider="anthropic", dry_run=False: {"ok": True, "auto": True, "dry_run": dry_run},
+    )
     ctx = _Ctx()
     mod.register(ctx)
     return mod, ctx
@@ -133,10 +137,10 @@ def test_registered_schema_exposes_parameters(plugin):
     props = params.get("properties")
     assert isinstance(props, dict)
     assert set(props) >= {"action", "target", "provider", "dry_run"}
-    assert props["action"]["enum"] == ["list", "switch", "plan"]
+    assert props["action"]["enum"] == ["list", "switch", "plan", "auto"]
 
 
-def test_gate_escalates_switch_but_not_plan_or_list(plugin):
+def test_gate_escalates_switch_and_auto_but_not_plan_or_list(plugin):
     mod, ctx = plugin
     gate = ctx.hooks["pre_tool_call"]
     real = gate(tool_name="account_switch", args={"action": "switch", "target": "acct-a"})
@@ -144,6 +148,8 @@ def test_gate_escalates_switch_but_not_plan_or_list(plugin):
     assert gate(tool_name="account_switch", args={"action": "switch", "target": "acct-a", "dry_run": True}) is None
     assert gate(tool_name="account_switch", args={"action": "plan", "target": "acct-a"}) is None
     assert gate(tool_name="account_switch", args={"action": "list"}) is None
-    # `auto` is not part of this build: the tool refuses it instead of rotating
-    out = json.loads(registry.dispatch("account_switch", {"action": "auto"}))
-    assert out["ok"] is False
+    auto = gate(tool_name="account_switch", args={"action": "auto"})
+    assert auto and auto["action"] == "approve" and "auto-rotate" in auto["message"]
+    assert gate(tool_name="account_switch", args={"action": "auto", "dry_run": True}) is None
+    out = json.loads(registry.dispatch("account_switch", {"action": "auto", "dry_run": True}))
+    assert out["auto"] is True and out["dry_run"] is True

@@ -165,7 +165,7 @@ def test_usage_uses_public_helper_and_skips_dead_and_benched(mod, monkeypatch):
 def test_catalog_build_has_no_auth_store_or_refresh_paths(mod):
     src = PLUGIN_FILE.read_text()
     for forbidden in ("write_credential_pool", "read_credential_pool", "_auth_store_lock",
-                      "_refresh_entry", "_get_json", "auto_rotate", "oauth/usage"):
+                      "_refresh_entry", "_get_json", "oauth/usage", "_write_auto_status"):
         assert forbidden not in src, forbidden
 
 
@@ -223,7 +223,7 @@ def test_pool_status_states_and_active(mod, monkeypatch):
 
 def test_status_cli_prints_sentinel_json_line(mod, monkeypatch, capsys):
     import json as _json
-    monkeypatch.setattr(mod, "pool_status", lambda p="anthropic": {"provider": p, "state": "setup"})
+    monkeypatch.setattr(mod, "pool_status", lambda p="anthropic", **kw: {"provider": p, "state": "setup"})
     mod._handle_cli(SimpleNamespace(cmd="status", provider="anthropic", json=True))
     line = capsys.readouterr().out.strip()
     assert line.startswith(mod.STATUS_LINE_PREFIX)
@@ -272,3 +272,85 @@ def test_slash_provider_flag_anywhere(mod, monkeypatch):
                         seen.update(t=t, p=p, dry=dry_run) or {"ok": False, "error": "x"})
     mod._slash("plan work --provider=openai")
     assert seen == {"t": "work", "p": "openai", "dry": True}
+
+
+# -- auto rotation (read-only, catalog build) ---------------------------------------
+
+def _usage(five=0.0, week=0.0, scoped=None):
+    info = {"five_hour": {"used_percent": five}, "week": {"used_percent": week}}
+    if scoped is not None:
+        info["scoped"] = {"used_percent": scoped[0], "active": scoped[1]}
+    return info
+
+
+def test_auto_promotes_login_with_most_weekly_headroom(mod, monkeypatch):
+    accounts = [_acct(mod, 0, "busy@x"), _acct(mod, 1, "fresh@x"), _acct(mod, 2, "dead@x", status="dead"),
+                _acct(mod, 3, "bench@x", status="exhausted", bench_until=time.time() + 600)]
+    monkeypatch.setattr(mod, "_read_accounts", lambda p: (p, accounts))
+    monkeypatch.setattr(mod, "_usage_for_accounts", lambda accs, p: {
+        "busy@x": _usage(five=10, week=60), "fresh@x": _usage(five=40, week=0)})
+    promoted = []
+    monkeypatch.setattr(mod, "switch", lambda target, provider="anthropic", dry_run=False:
+                        promoted.append(target) or {"ok": True})
+    monkeypatch.setattr(mod, "list_accounts", lambda p="anthropic", with_usage=True: {
+        "accounts": [{"label": "fresh@x"}, {"label": "busy@x"}]})
+    report = mod.auto_rotate()
+    assert promoted == ["id1"]  # switch() gets the entry id of the winner
+    assert report["promoted"] == "fresh@x"
+    assert report["alive"] == ["busy@x", "fresh@x"]
+    assert report["dead"] == ["dead@x"] and report["benched"] == ["bench@x"]
+    assert report["order_after"] == ["fresh@x", "busy@x"]
+
+
+def test_auto_skips_exhausted_and_dry_run_moves_nothing(mod, monkeypatch):
+    accounts = [_acct(mod, 0, "full@x"), _acct(mod, 1, "spare@x"), _acct(mod, 2, "unknown@x")]
+    monkeypatch.setattr(mod, "_read_accounts", lambda p: (p, accounts))
+    monkeypatch.setattr(mod, "_usage_for_accounts", lambda accs, p: {
+        "full@x": _usage(five=100, week=20), "spare@x": _usage(five=5, week=30)})
+    monkeypatch.setattr(mod, "switch", lambda *a, **k: pytest.fail("dry run must not switch"))
+    report = mod.auto_rotate(dry_run=True)
+    assert report["exhausted"] == ["full@x"] and report["unknown"] == ["unknown@x"]
+    assert report["would_promote"] == "spare@x" and report["promoted"] is None
+
+
+def test_auto_treats_active_scoped_limit_as_exhausted(mod, monkeypatch):
+    accounts = [_acct(mod, 0, "scoped@x"), _acct(mod, 1, "ok@x")]
+    monkeypatch.setattr(mod, "_read_accounts", lambda p: (p, accounts))
+    monkeypatch.setattr(mod, "_usage_for_accounts", lambda accs, p: {
+        "scoped@x": _usage(week=10, scoped=(100.0, True)), "ok@x": _usage(week=50)})
+    monkeypatch.setattr(mod, "switch", lambda target, provider="anthropic", dry_run=False: {"ok": True})
+    monkeypatch.setattr(mod, "list_accounts", lambda p="anthropic", with_usage=True: {"accounts": []})
+    report = mod.auto_rotate()
+    assert report["exhausted"] == ["scoped@x"] and report["promoted"] == "ok@x"
+
+
+def test_auto_already_first_is_not_moved(mod, monkeypatch):
+    accounts = [_acct(mod, 0, "best@x"), _acct(mod, 1, "other@x")]
+    monkeypatch.setattr(mod, "_read_accounts", lambda p: (p, accounts))
+    monkeypatch.setattr(mod, "_usage_for_accounts", lambda accs, p: {
+        "best@x": _usage(week=5), "other@x": _usage(week=50)})
+    monkeypatch.setattr(mod, "switch", lambda *a, **k: pytest.fail("already first: nothing to move"))
+    report = mod.auto_rotate()
+    assert report["promoted"] == "best@x"
+
+
+def test_auto_without_oauth_logins_reports_no_headroom(mod, monkeypatch):
+    accounts = [_acct(mod, 0, "KEY", auth_type="api_key")]
+    monkeypatch.setattr(mod, "_read_accounts", lambda p: (p, accounts))
+    monkeypatch.setattr(mod, "_usage_for_accounts", lambda accs, p: None)
+    report = mod.auto_rotate()
+    assert report["ok"] is True and report["alive"] == [] and report["promoted"] is None
+    assert "No login has headroom" in mod.render_auto(report)
+
+
+def test_pool_status_usage_only_when_asked(mod, monkeypatch):
+    monkeypatch.setattr(mod, "_pool_strategy", lambda p: "fill_first")
+    monkeypatch.setattr(mod, "_read_accounts", lambda p: (p, [_acct(mod, 0, "a@x")]))
+    calls = []
+    monkeypatch.setattr(mod, "_usage_for_accounts", lambda accs, p: calls.append(p) or {"a@x": _usage(week=7)})
+    plain = mod.pool_status()
+    assert calls == [] and plain["accounts"][0]["usage"] is None and plain["usage_available"] is False
+    rich = mod.pool_status(with_usage=True)
+    assert calls == ["anthropic"]
+    assert rich["accounts"][0]["usage"]["week"]["used_percent"] == 7 and rich["usage_available"] is True
+

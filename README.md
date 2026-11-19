@@ -8,9 +8,9 @@ Hermes rotates a *credential pool* per provider: add several OAuth logins (`herm
 
 This plugin adds exactly that:
 
-- **`/switch`** in any chat — `/switch list`, `/switch hendrik@…`, `/switch plan work`, `/switch setup`
-- **Tool `account_switch`** — the agent can list and plan; a real switch is escalated to the human-approval gate (see Security)
-- **CLI `hermes credential-pool-switcher list|switch|plan|status|setup`**
+- **`/switch`** in any chat — `/switch list`, `/switch hendrik@…`, `/switch plan work`, `/switch setup`, `/switch auto`
+- **Tool `account_switch`** — the agent can list, plan, and auto-rotate; a real switch or auto rotation is escalated to the human-approval gate (see Security)
+- **CLI `hermes credential-pool-switcher list|switch|plan|auto|status|setup`**
 
 ## What it does
 
@@ -22,11 +22,10 @@ This plugin adds exactly that:
 
 ## Security
 
-- **Agent-initiated switches require human approval.** Reordering the pool changes which account gets billed first, so the plugin registers a `pre_tool_call` hook that escalates every model-issued `switch` (not `list`/`plan`/`dry_run`) to Hermes' approval gate. `/switch` and the CLI are unaffected — they are already user actions.
+- **Agent-initiated switches require human approval.** Reordering the pool changes which account gets billed first, so the plugin registers a `pre_tool_call` hook that escalates every model-issued `switch` and `auto` (not `list`/`plan`/`dry_run`) to Hermes' approval gate. `/switch` and the CLI are unaffected — they are already user actions.
 - **Tokens are never printed, logged, returned, or written by the plugin.**
-- **Usage percentages** (`/switch list`) go through Hermes' public `agent.account_usage.fetch_account_usage(read_only=True)`: each usable pooled OAuth token is sent to the provider's own API (`api.anthropic.com`) by that helper. Dead and still-benched logins are skipped; nothing is refreshed, rotated or written.
-- **`auth.json`:** the plugin never reads or writes it itself. Switching re-orders priorities through the pool object (`move_entry`, the call behind `hermes auth priority`); everything else is read-only.
-- This catalog build has no automatic rotation. The full build with `auto` (usage-based benching and promotion, unattended cron mode) lives on the repository's `main` branch.
+- **Usage percentages** (`/switch list`, the chip's usage bars, `auto`) go through Hermes' public `agent.account_usage.fetch_account_usage(read_only=True)`: each usable pooled OAuth token is sent to the provider's own API (`api.anthropic.com`) by that helper. Dead and still-benched logins are skipped; nothing is refreshed, rotated or written.
+- **`auth.json`:** the plugin never reads or writes it itself. Switching and auto rotation re-order priorities through the pool object (`move_entry`, the call behind `hermes auth priority`); everything else is read-only. Auto rotation does not bench logins: Hermes' own pool handles 429s.
 
 ## Install
 
@@ -86,12 +85,12 @@ the app automatically; enable it once under **Capabilities → Plugins**
 - Afterwards the **account Hermes uses next**, coloured by pool health:
   green = all usable, amber = some benched or dead, red = none usable (with the
   time the next one is free).
-- Click it for every account's state; click a usable account to put it first;
-  copy the command to revive a dead login or add another.
+- Click it for every account's state, plus its 5h and weekly usage bars (loaded while the popover is open); click a usable account to put it first; copy the command to revive a dead login or add another. **Auto-rotate now** promotes the login with the most headroom.
 
 It reads `hermes credential-pool-switcher status --json` — a local snapshot
 without network calls or token refreshes — every 90 s, and refreshes at once
-when a switch happens inside the gateway.
+when a switch happens inside the gateway. The usage bars call `status --json --usage`
+only while the popover is open.
 
 ## Usage
 
@@ -100,6 +99,7 @@ when a switch happens inside the gateway.
 
 /switch snailberg@              → move that account to the front
 /switch plan snailberg@         → dry-run preview
+/switch auto [--dry-run]        → promote the login with the most usage headroom
 /switch list --provider=openai  → other pooled providers (flag works in any position)
 ```
 
@@ -109,7 +109,7 @@ Agent tool:
 {"action": "switch", "target": "hendrik@kaiser-mail.de", "provider": "anthropic"}
 ```
 
-(real switches are escalated to human approval; `action: "list"` / `"plan"` run directly)
+(real switches and `auto` are escalated to human approval; `action: "list"` / `"plan"` run directly)
 
 CLI:
 
@@ -117,8 +117,13 @@ CLI:
 hermes credential-pool-switcher list
 hermes credential-pool-switcher switch '#2'
 hermes credential-pool-switcher plan work
+hermes credential-pool-switcher auto --dry-run
 hermes credential-pool-switcher status
 ```
+
+## Auto rotation
+
+`auto` reads each usable login's usage (5h, weekly, model-scoped) and moves the one with the most headroom to priority 0. Logins at 100% in any window, benched by Hermes, dead, or without usage data are left alone. Unattended, run it from cron every 30 minutes: `hermes credential-pool-switcher auto`.
 
 ## Targets
 
