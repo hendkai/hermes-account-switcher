@@ -44,7 +44,7 @@ const MESSAGES = {
     setupIntro: 'No accounts yet. The switcher works on Hermes\u2019 credential pool (~/.hermes/auth.json).',
     step1: 'Add each Claude account once \u2014 opens the browser login:',
     step2: 'Repeat for every account, then come back here: the indicator switches to the account in use.',
-    step3: 'Optional: rotate by real quota every 30 min (cron):',
+    step3: 'Nothing else to do: accounts are listed with their 5 h and weekly bars, and the switcher moves to the one with the most headroom by itself.',
     allExhausted: 'Claude: all exhausted',
     readyAt: (t) => `next ready ${t}`,
     inUse: 'in use',
@@ -67,6 +67,8 @@ const MESSAGES = {
     switchFailed: (msg) => `Switch failed: ${msg}`,
     autoDone: 'Auto rotation finished',
     autoFailed: (msg) => `Auto rotation failed: ${msg}`,
+    autoOn: (mins, last) => `Auto-switch on \u00b7 every ${mins} min` + (last ? ` \u00b7 last check ${last}` : ''),
+    autoOff: 'Auto-switch off (HERMES_CPS_AUTO_ROTATE=0)',
     loadFailed: 'Account switcher unavailable',
     retry: 'click to retry'
   },
@@ -76,7 +78,7 @@ const MESSAGES = {
     setupIntro: 'Noch keine Accounts hinterlegt. Der Switcher nutzt den Credential-Pool von Hermes (~/.hermes/auth.json).',
     step1: 'Jeden Claude-Account einmal hinzuf\u00fcgen \u2014 \u00f6ffnet den Browser-Login:',
     step2: 'F\u00fcr jeden Account wiederholen. Danach zeigt der Indikator hier den aktiven Account.',
-    step3: 'Optional: alle 30 Min. nach echtem Verbrauch rotieren (Cron):',
+    step3: 'Mehr ist nicht n\u00f6tig: Accounts erscheinen mit 5-Std.- und Wochen-Balken, und der Switcher wechselt selbst zum Account mit dem meisten Spielraum.',
     allExhausted: 'Claude: alle ersch\u00f6pft',
     readyAt: (t) => `wieder frei ${t}`,
     inUse: 'aktiv',
@@ -99,6 +101,8 @@ const MESSAGES = {
     switchFailed: (msg) => `Wechsel fehlgeschlagen: ${msg}`,
     autoDone: 'Auto-Rotation fertig',
     autoFailed: (msg) => `Auto-Rotation fehlgeschlagen: ${msg}`,
+    autoOn: (mins, last) => `Auto-Switch an \u00b7 alle ${mins} Min.` + (last ? ` \u00b7 zuletzt gepr\u00fcft ${last}` : ''),
+    autoOff: 'Auto-Switch aus (HERMES_CPS_AUTO_ROTATE=0)',
     loadFailed: 'Account-Switcher nicht erreichbar',
     retry: 'Klick = erneut versuchen'
   }
@@ -220,8 +224,7 @@ function SetupSteps({ status, t }) {
       jsx('p', { children: `1. ${t('step1')}` }),
       jsx(CommandLine, { text: status.add_hint }),
       jsx('p', { children: `2. ${t('step2')}` }),
-      jsx('p', { children: `3. ${t('step3')}` }),
-      jsx(CommandLine, { text: `hermes ${CLI} auto` })
+      jsx('p', { children: `3. ${t('step3')}` })
     ]
   })
 }
@@ -302,6 +305,14 @@ function Panel({ status, t }) {
         : null,
       status.state === 'exhausted' && status.next_ready_at
         ? jsx('p', { className: 'text-(--ui-text-tertiary)', children: t('readyAt', localTime(status.next_ready_at)) })
+        : null,
+      status.state !== 'setup' && status.auto
+        ? jsx('p', {
+            className: 'text-(--ui-text-tertiary)',
+            children: status.auto.enabled
+              ? t('autoOn', status.auto.interval_minutes, localTime(status.auto.last_run))
+              : t('autoOff')
+          })
         : null,
       ...dead.map((row) =>
         jsxs('div', {

@@ -1,6 +1,6 @@
 name: credential-pool-switcher
-version: 1.4.0
-description: "Switch between pooled provider accounts (e.g. multiple Claude logins) from chat (/switch), CLI, the agent itself, or a desktop status bar chip. Lists every account with priority, bench/dead state and Anthropic usage, moves any account to the front of the rotation, auto-rotates Anthropic logins to the one with the most usage headroom, refuses unsafe switches (dead logins, env-fed API keys), and guides account setup. Model-initiated switches and auto rotations are escalated to human approval."
+version: 1.5.0
+description: "Switch between pooled provider accounts (e.g. multiple Claude logins) from chat (/switch), CLI, the agent itself, or a desktop status bar chip. Lists every account with priority, bench/dead state and Anthropic usage, moves any account to the front of the rotation, automatically rotates Anthropic logins to the one with the most usage headroom (no cron needed), refuses unsafe switches (dead logins, env-fed API keys), and guides account setup. Model-initiated switches and auto rotations are escalated to human approval."
 author: hendkai
 kind: standalone
 requires_hermes: ">=0.23.0"
@@ -8,5 +8,6 @@ provides_tools:
   - account_switch
 provides_hooks:
   - pre_tool_call
+  - pre_llm_call
 provides_commands:
   - credential-pool-switcher

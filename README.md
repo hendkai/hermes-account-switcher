@@ -85,7 +85,7 @@ the app automatically; enable it once under **Capabilities → Plugins**
 - Afterwards the **account Hermes uses next**, coloured by pool health:
   green = all usable, amber = some benched or dead, red = none usable (with the
   time the next one is free).
-- Click it for every account's state, plus its 5h and weekly usage bars (loaded while the popover is open); click a usable account to put it first; copy the command to revive a dead login or add another. **Auto-rotate now** promotes the login with the most headroom.
+- Click it for every account's state with its 5h and weekly usage bars (loaded while the popover is open, benched logins included), plus the auto-switch status; click a usable account to put it first; copy the command to revive a dead login or add another. **Auto-rotate now** promotes the login with the most headroom.
 
 It reads `hermes credential-pool-switcher status --json` — a local snapshot
 without network calls or token refreshes — every 90 s, and refreshes at once
@@ -123,7 +123,11 @@ hermes credential-pool-switcher status
 
 ## Auto rotation
 
-`auto` reads each usable login's usage (5h, weekly, model-scoped) and moves the one with the most headroom to priority 0. Logins at 100% in any window, benched by Hermes, dead, or without usage data are left alone. Unattended, run it from cron every 30 minutes: `hermes credential-pool-switcher auto`.
+Automatic by default — add the accounts, nothing else. While Hermes is in use, a `pre_llm_call` hook starts a background run at most every 10 minutes (shared across the gateway, CLI and desktop app through a small state file, `credential-pool-switcher-state.json` in the Hermes home: timestamps and the last result, no credentials). A run reads each login's usage (5h, weekly, model-scoped) and moves the one with the most weekly headroom to priority 0. It keeps the current login unless the winner is at least 5 points better, so two similar logins do not swap back and forth. Logins at 100% in any window, benched by Hermes, dead, or without usage data are left alone.
+
+- Turn it off: `HERMES_CPS_AUTO_ROTATE=0` in the environment of the Hermes process.
+- Run it by hand: `/switch auto [--dry-run]`, `hermes credential-pool-switcher auto`, or **Auto-rotate now** in the chip popover.
+- A cron job is optional: it only helps if Hermes sits idle for long stretches.
 
 ## Targets
 

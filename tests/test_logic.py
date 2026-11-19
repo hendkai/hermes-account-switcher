@@ -22,11 +22,13 @@ PLUGIN_FILE = Path(__file__).resolve().parents[1] / "__init__.py"
 
 
 @pytest.fixture()
-def mod():
+def mod(tmp_path, monkeypatch):
     spec = importlib.util.spec_from_file_location("credential_pool_switcher_logic", PLUGIN_FILE)
     m = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = m
     spec.loader.exec_module(m)
+    m._state_path = lambda: tmp_path / "state.json"  # never touch the real Hermes home
+    monkeypatch.delenv("HERMES_CPS_AUTO_ROTATE", raising=False)
     yield m
     sys.modules.pop(spec.name, None)
 
@@ -142,7 +144,7 @@ def test_move_to_front_cli_fallback_checks_success_line(mod, monkeypatch):
 
 # -- usage via the public helper -----------------------------------------------------
 
-def test_usage_uses_public_helper_and_skips_dead_and_benched(mod, monkeypatch):
+def test_usage_uses_public_helper_and_skips_dead(mod, monkeypatch):
     W = lambda label, pct, scope="account": SimpleNamespace(label=label, used_percent=pct, scope=scope)
     calls = []
 
@@ -157,9 +159,11 @@ def test_usage_uses_public_helper_and_skips_dead_and_benched(mod, monkeypatch):
     accounts = [_acct(mod, 0, "ok@x"), _acct(mod, 1, "dead@x", status="dead"),
                 _acct(mod, 2, "bench@x", status="exhausted", bench_until=time.time() + 600)]
     out = mod._usage_for_accounts(accounts)
-    assert calls == [("anthropic", "tok-ok@x", True)]  # read_only, only the usable login
-    assert out == {"ok@x": {"five_hour": {"used_percent": 12.0}, "week": {"used_percent": 0.0},
-                            "scoped": {"used_percent": 100.0, "active": True}}}
+    # read_only; dead logins are skipped, benched ones are read so their bars show why
+    assert sorted(c[1] for c in calls) == ["tok-bench@x", "tok-ok@x"] and all(c[2] for c in calls)
+    assert out["ok@x"] == {"five_hour": {"used_percent": 12.0}, "week": {"used_percent": 0.0},
+                           "scoped": {"used_percent": 100.0, "active": True}}
+    assert "dead@x" not in out
 
 
 def test_catalog_build_has_no_auth_store_or_refresh_paths(mod):
@@ -354,3 +358,90 @@ def test_pool_status_usage_only_when_asked(mod, monkeypatch):
     assert calls == ["anthropic"]
     assert rich["accounts"][0]["usage"]["week"]["used_percent"] == 7 and rich["usage_available"] is True
 
+
+
+# -- automatic mode (hook-driven, throttled) ----------------------------------------
+
+def test_auto_keeps_current_login_within_margin(mod, monkeypatch):
+    accounts = [_acct(mod, 0, "cur@x"), _acct(mod, 1, "alt@x")]
+    monkeypatch.setattr(mod, "_read_accounts", lambda p: (p, accounts))
+    monkeypatch.setattr(mod, "_usage_for_accounts", lambda accs, p: {
+        "cur@x": _usage(week=30), "alt@x": _usage(week=27)})  # 3 points better: not worth a swap
+    monkeypatch.setattr(mod, "switch", lambda *a, **k: pytest.fail("within margin: no swap"))
+    report = mod.auto_rotate()
+    assert report["promoted"] == "cur@x" and not report.get("changed")
+
+
+def test_auto_swaps_when_clearly_better_and_reports_changed(mod, monkeypatch):
+    accounts = [_acct(mod, 0, "cur@x"), _acct(mod, 1, "alt@x")]
+    monkeypatch.setattr(mod, "_read_accounts", lambda p: (p, accounts))
+    monkeypatch.setattr(mod, "_usage_for_accounts", lambda accs, p: {
+        "cur@x": _usage(week=40), "alt@x": _usage(week=10)})
+    monkeypatch.setattr(mod, "switch", lambda *a, **k: {"ok": True})
+    monkeypatch.setattr(mod, "list_accounts", lambda p="anthropic", with_usage=True: {"accounts": []})
+    report = mod.auto_rotate()
+    assert report["promoted"] == "alt@x" and report["changed"] is True
+
+
+def test_maybe_auto_rotate_is_throttled_across_calls(mod, monkeypatch):
+    runs = []
+    monkeypatch.setattr(mod, "auto_rotate", lambda provider="anthropic", dry_run=False:
+                        runs.append(provider) or {"ok": True, "promoted": "a@x"})
+    t0 = 1_000_000.0
+    assert mod.maybe_auto_rotate(background=False, now=t0) is True
+    assert mod.maybe_auto_rotate(background=False, now=t0 + 60) is False          # inside the interval
+    assert mod.maybe_auto_rotate(background=False, now=t0 + mod.AUTO_INTERVAL_SECONDS + 1) is True
+    assert len(runs) == 2
+    info = mod.auto_info()
+    assert info["enabled"] is True and info["last_promoted"] == "a@x" and info["last_error"] is None
+
+
+def test_maybe_auto_rotate_respects_opt_out(mod, monkeypatch):
+    monkeypatch.setenv("HERMES_CPS_AUTO_ROTATE", "0")
+    monkeypatch.setattr(mod, "auto_rotate", lambda *a, **k: pytest.fail("opted out"))
+    assert mod.maybe_auto_rotate(background=False) is False
+    assert mod.auto_info()["enabled"] is False
+
+
+def test_auto_worker_failure_is_recorded_not_raised(mod, monkeypatch):
+    def boom(*a, **k):
+        raise RuntimeError("usage down")
+    monkeypatch.setattr(mod, "auto_rotate", boom)
+    assert mod.maybe_auto_rotate(background=False, now=5_000_000.0) is True
+    assert mod.auto_info()["last_error"] == "RuntimeError"
+    assert mod._auto_running is False  # slot released, next interval can run
+
+
+def test_pre_llm_call_hook_never_raises(mod, monkeypatch):
+    monkeypatch.setattr(mod, "maybe_auto_rotate", lambda *a, **k: 1 / 0)
+    assert mod._on_pre_llm_call(session_id="s") is None
+
+
+def test_register_adds_pre_llm_call_hook(mod):
+    hooks = {}
+    ctx = SimpleNamespace(register_hook=lambda n, f: hooks.update({n: f}),
+                          register_tool=lambda **k: None, register_cli_command=lambda **k: None,
+                          register_command=lambda *a, **k: None)
+    mod.register(ctx)
+    assert set(hooks) == {"pre_tool_call", "pre_llm_call"}
+
+
+def test_usage_includes_benched_logins_but_not_dead(mod, monkeypatch):
+    accounts = [_acct(mod, 0, "ok@x"), _acct(mod, 1, "bench@x", status="exhausted", bench_until=time.time() + 600),
+                _acct(mod, 2, "dead@x", status="dead")]
+    seen = []
+    entries = [SimpleNamespace(label=a.label, access_token="tok-" + a.label, auth_type="oauth") for a in accounts]
+    monkeypatch.setattr(mod, "_load_pool", lambda p: SimpleNamespace(entries=lambda: entries))
+    win = lambda label, pct, scope="account": SimpleNamespace(label=label, used_percent=pct, scope=scope)
+    fake = types.ModuleType("agent.account_usage")
+    fake.fetch_account_usage = lambda provider, api_key=None, read_only=False: (
+        seen.append(api_key) or SimpleNamespace(windows=[
+            win("Current session", 12.0), win("Current week", 34.0),
+            win("Opus week", 50.0, "model"), win("Sonnet week", 80.0, "model")]))
+    monkeypatch.setitem(sys.modules, "agent.account_usage", fake)
+    monkeypatch.setitem(sys.modules, "agent", types.ModuleType("agent"))
+    out = mod._usage_for_accounts(accounts)
+    assert set(out) == {"ok@x", "bench@x"} and sorted(seen) == ["tok-bench@x", "tok-ok@x"]
+    assert out["ok@x"]["five_hour"]["used_percent"] == 12.0
+    assert out["ok@x"]["week"]["used_percent"] == 34.0
+    assert out["ok@x"]["scoped"]["used_percent"] == 80.0  # tightest model cap wins

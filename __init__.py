@@ -18,13 +18,16 @@ How it touches Hermes:
   and parsing their output. Switching = "move to priority 0", i.e. that
   account is tried first on the next model call (``fill_first`` strategy).
 * **Usage percentages** (list only) go through Hermes' public
-  ``agent.account_usage.fetch_account_usage(read_only=True)``: each usable
-  pooled OAuth token is sent to the provider's own API (api.anthropic.com) by
-  that helper. Dead and still-benched logins are skipped; nothing is
+  ``fetch_account_usage(read_only=True)``: each usable pooled OAuth token is sent to the provider's own API (api.anthropic.com) by
+  that helper. Dead logins are skipped; nothing is
   refreshed, rotated or written.
 * **Auto rotation** (``auto``) uses the same usage data and ``switch`` (the
-  pool's ``move_entry``) to promote the login with the most headroom. It does
-  not bench logins: Hermes' own pool handles 429s.
+  pool's ``move_entry``) to promote the login with the most headroom. It runs
+  by itself: the ``pre_llm_call`` hook starts it in the background at most
+  every 10 minutes (HERMES_CPS_AUTO_ROTATE=0 turns that off). It does
+  not bench logins: Hermes' own pool handles 429s. Besides the pool, the plugin
+  keeps one small state file (``credential-pool-switcher-state.json`` in the
+  Hermes home: timestamps and the last result, no credentials).
 
 The plugin never reads or writes auth.json itself and never refreshes tokens.
 Tokens are never printed, logged, returned, or written by this plugin.
@@ -35,10 +38,13 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 import re
+import threading
 import time
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, List, Optional, Tuple
 
 log = logging.getLogger("credential_pool_switcher")
@@ -384,13 +390,13 @@ def _usage_for_accounts(accounts: List[Account], provider: str = DEFAULT_PROVIDE
     """Best-effort per-account usage for the list view.
 
     Uses Hermes' public ``fetch_account_usage(read_only=True)``: it never
-    refreshes, rotates or benches a pool entry. Dead and still-benched logins
-    are skipped (their token is useless / the endpoint rate-limits), so an
-    expired idle login simply shows no percentages.
+    refreshes, rotates or benches a pool entry. Dead logins are skipped (their
+    token is useless); benched ones are still read, so their bars show why.
+    An expired idle login simply shows no percentages.
     Returns ``{label: {"five_hour": ..., "week": ..., "scoped": {...}}}`` or None.
     """
     wanted = {a.label for a in accounts
-              if a.auth_type == "oauth" and a.status != STATUS_DEAD and not _is_benched(a, time.time())}
+              if a.auth_type == "oauth" and a.status != STATUS_DEAD}
     if not wanted:
         return None
     try:
@@ -419,7 +425,9 @@ def _usage_for_accounts(accounts: List[Account], provider: str = DEFAULT_PROVIDE
             name = str(w.label or "").lower()
             pct = w.used_percent
             if getattr(w, "scope", "account") == "model":
-                windows["scoped"] = {"used_percent": pct, "active": bool(pct is not None and pct >= 100)}
+                prev = (windows.get("scoped") or {}).get("used_percent")
+                if prev is None or (pct is not None and pct > prev):  # keep the tightest model cap
+                    windows["scoped"] = {"used_percent": pct, "active": bool(pct is not None and pct >= 100)}
             elif "session" in name:
                 windows["five_hour"] = {"used_percent": pct}
             elif "week" in name:
@@ -600,6 +608,7 @@ def pool_status(provider: str = DEFAULT_PROVIDER, with_usage: bool = False) -> d
         "count": len(accounts),
         "usable": len(usable),
         "usage_available": bool(usage),
+        "auto": auto_info(),
         "active": next((r for r in rows if r["active"]), None),
         "next_ready_at": _iso_utc(min(benched_until)) if benched_until else None,
         "add_hint": _add_hint(provider),
@@ -621,8 +630,8 @@ def render_setup(status: dict, markdown: bool = False) -> str:
     lines += [
         f"1. Add each Claude account once (opens the browser login): {tick}{_add_hint(provider)}{tick}",
         f"2. Check: {tick}/switch list{tick} — or the status bar chip in the desktop app.",
-        f"3. Pick one by hand: {tick}/switch <label>{tick}; or rotate by real quota: {tick}/switch auto{tick}"
-        f" (unattended: run {tick}hermes {PLUGIN_ID} auto{tick} from cron every 30 min).",
+        f"3. That is all: accounts are rotated automatically by real quota (every {AUTO_INTERVAL_SECONDS // 60} min while "
+        f"Hermes is in use). By hand: {tick}/switch <label>{tick} or {tick}/switch auto{tick}.",
     ]
     for row in status["accounts"]:
         if row["status"] == "dead":
@@ -762,9 +771,18 @@ def auto_rotate(provider: str = DEFAULT_PROVIDER, *, dry_run: bool = False) -> d
             candidates.append(a)
 
     if candidates:
-        best = min(candidates, key=lambda a: (
-            _window_pct(usage[a.label], "week"), _window_pct(usage[a.label], "five_hour"), a.priority))
-        if best.priority == 0:
+        def _rank(a: Account):
+            return (_window_pct(usage[a.label], "week"), _window_pct(usage[a.label], "five_hour"), a.priority)
+
+        best = min(candidates, key=_rank)
+        current = min(candidates, key=lambda a: a.priority)  # what Hermes would use right now
+        # Hysteresis: keep the current login unless the winner is clearly better,
+        # so two similar logins do not swap places every run (each swap drops the prompt cache).
+        if (current is not best and _window_pct(usage[current.label], "week")
+                - _window_pct(usage[best.label], "week") < AUTO_SWITCH_MARGIN_PCT):
+            best = current
+        first_priority = min(a.priority for a in accounts if a.status != STATUS_DEAD)
+        if best.priority == first_priority:
             report["promoted"] = best.label  # already first
         elif dry_run:
             report["would_promote"] = best.label
@@ -772,12 +790,122 @@ def auto_rotate(provider: str = DEFAULT_PROVIDER, *, dry_run: bool = False) -> d
             plan = switch(best.id, provider)
             if plan.get("ok"):
                 report["promoted"] = best.label
+                report["changed"] = True
                 after = list_accounts(provider, with_usage=False)
                 report["order_after"] = [a["label"] for a in after["accounts"]]
             else:
                 report["ok"] = False
                 report["error"] = f"promotion failed: {plan.get('error')}"
     return report
+
+
+# -- automatic rotation (no cron, no click) ------------------------------------------
+#
+# Every model call passes the ``pre_llm_call`` hook. It starts a background
+# auto run at most once per AUTO_INTERVAL_SECONDS — across all Hermes processes
+# (gateway, CLI, desktop) through a small state file, so the usage endpoint is
+# not polled by several processes at once. The user only adds accounts.
+# Opt out with HERMES_CPS_AUTO_ROTATE=0.
+
+AUTO_INTERVAL_SECONDS = 10 * 60
+AUTO_SWITCH_MARGIN_PCT = 5.0
+_auto_lock = threading.Lock()
+_auto_running = False
+
+
+def auto_enabled() -> bool:
+    return os.environ.get("HERMES_CPS_AUTO_ROTATE", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _state_path() -> Path:
+    try:
+        from hermes_constants import get_hermes_home
+        home = Path(get_hermes_home())
+    except Exception:
+        home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+    return home / "credential-pool-switcher-state.json"
+
+
+def _read_state() -> dict:
+    try:
+        data = json.loads(_state_path().read_text())
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _write_state(update: dict) -> None:
+    """Merge ``update`` into the state file (timestamps and the last result; never credentials)."""
+    try:
+        path = _state_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps({**_read_state(), **update}))
+        os.replace(tmp, path)
+    except Exception as exc:
+        log.debug("state file not written: %s", exc)
+
+
+def auto_info() -> dict:
+    """Cheap description of the automatic mode for status views."""
+    state = _read_state()
+    last = state.get("last_run")
+    return {
+        "enabled": auto_enabled(),
+        "interval_minutes": AUTO_INTERVAL_SECONDS // 60,
+        "last_run": _iso_utc(last) if isinstance(last, (int, float)) else None,
+        "last_promoted": state.get("last_promoted"),
+        "last_error": state.get("last_error"),
+    }
+
+
+def _auto_worker(provider: str) -> None:
+    global _auto_running
+    try:
+        report = auto_rotate(provider)
+        _write_state({
+            "last_finished": time.time(),
+            "last_promoted": report.get("promoted"),
+            "last_error": None if report.get("ok") else report.get("error"),
+        })
+        if report.get("changed"):
+            log.info("auto rotation: %s is now tried first", report.get("promoted"))
+    except Exception as exc:  # a failed run must never reach the model call
+        log.debug("auto rotation failed: %s", exc)
+        _write_state({"last_finished": time.time(), "last_error": f"{type(exc).__name__}"})
+    finally:
+        with _auto_lock:
+            _auto_running = False
+
+
+def maybe_auto_rotate(provider: str = DEFAULT_PROVIDER, *, background: bool = True,
+                      now: Optional[float] = None) -> bool:
+    """Start an auto run when one is due. Returns True when a run was started."""
+    global _auto_running
+    if not auto_enabled():
+        return False
+    now = time.time() if now is None else now
+    with _auto_lock:
+        if _auto_running:
+            return False
+        last = _read_state().get("last_run")
+        if isinstance(last, (int, float)) and 0 <= now - last < AUTO_INTERVAL_SECONDS:
+            return False
+        _write_state({"last_run": now})  # claim the slot for all processes
+        _auto_running = True
+    if background:
+        threading.Thread(target=_auto_worker, args=(provider,), name="cps-auto-rotate", daemon=True).start()
+    else:
+        _auto_worker(provider)
+    return True
+
+
+def _on_pre_llm_call(**_: Any) -> None:
+    try:
+        maybe_auto_rotate()
+    except Exception:
+        pass
+    return None
 
 
 # -- rendering ---------------------------------------------------------------
@@ -1041,6 +1169,7 @@ def _slash(arg: str = "", **_: Any) -> str:
 
 def register(ctx) -> None:
     ctx.register_hook("pre_tool_call", _on_pre_tool_call)
+    ctx.register_hook("pre_llm_call", _on_pre_llm_call)
     ctx.register_tool(
         name="account_switch",
         toolset="plugin_credential_pool_switcher",
