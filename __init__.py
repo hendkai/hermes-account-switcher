@@ -23,8 +23,9 @@ How it touches Hermes:
   refreshed, rotated or written.
 * **Auto rotation** (``auto``) uses the same usage data and ``switch`` (the
   pool's ``move_entry``) to promote the login with the most headroom. It runs
-  by itself: the ``pre_llm_call`` hook starts it in the background at most
-  every 10 minutes (HERMES_CPS_AUTO_ROTATE=0 turns that off). It does
+  only when you opt in (``plugins.credential-pool-switcher.auto_rotate: true``
+  in config.yaml; off by default): the ``pre_llm_call`` hook then starts it in
+  the background at most every 10 minutes. It does
   not bench logins: Hermes' own pool handles 429s. Besides the pool, the plugin
   keeps one small state file (``credential-pool-switcher-state.json`` in the
   Hermes home: timestamps and the last result, no credentials).
@@ -630,8 +631,9 @@ def render_setup(status: dict, markdown: bool = False) -> str:
     lines += [
         f"1. Add each Claude account once (opens the browser login): {tick}{_add_hint(provider)}{tick}",
         f"2. Check: {tick}/switch list{tick} — or the status bar chip in the desktop app.",
-        f"3. That is all: accounts are rotated automatically by real quota (every {AUTO_INTERVAL_SECONDS // 60} min while "
-        f"Hermes is in use). By hand: {tick}/switch <label>{tick} or {tick}/switch auto{tick}.",
+        f"3. Switch by hand: {tick}/switch <label>{tick} or {tick}/switch auto{tick}. Optional automatic rotation by "
+        f"real quota is OFF by default; to enable it set {tick}plugins.credential-pool-switcher.auto_rotate: true{tick} "
+        f"in config.yaml (then checked at most every {AUTO_INTERVAL_SECONDS // 60} min while Hermes is in use).",
     ]
     for row in status["accounts"]:
         if row["status"] == "dead":
@@ -804,8 +806,10 @@ def auto_rotate(provider: str = DEFAULT_PROVIDER, *, dry_run: bool = False) -> d
 # Every model call passes the ``pre_llm_call`` hook. It starts a background
 # auto run at most once per AUTO_INTERVAL_SECONDS — across all Hermes processes
 # (gateway, CLI, desktop) through a small state file, so the usage endpoint is
-# not polled by several processes at once. The user only adds accounts.
-# Opt out with HERMES_CPS_AUTO_ROTATE=0.
+# not polled by several processes at once. OPT-IN: off unless config.yaml has
+#   plugins:
+#     credential-pool-switcher:
+#       auto_rotate: true
 
 AUTO_INTERVAL_SECONDS = 10 * 60
 AUTO_SWITCH_MARGIN_PCT = 5.0
@@ -813,17 +817,37 @@ _auto_lock = threading.Lock()
 _auto_running = False
 
 
+def _hermes_home() -> Path:
+    from hermes_constants import get_hermes_home
+    return Path(get_hermes_home())
+
+
+def _truthy(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return value is True
+
+
 def auto_enabled() -> bool:
-    return os.environ.get("HERMES_CPS_AUTO_ROTATE", "1").strip().lower() not in {"0", "false", "no", "off"}
+    """Automatic rotation is opt-in: ``plugins.credential-pool-switcher.auto_rotate`` in config.yaml."""
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+    except Exception:
+        try:
+            import yaml
+            cfg = yaml.safe_load((_hermes_home() / "config.yaml").read_text()) or {}
+        except Exception:
+            return False
+    try:
+        section = (cfg.get("plugins") or {}).get("credential-pool-switcher") or {}
+        return _truthy(section.get("auto_rotate"))
+    except Exception:
+        return False
 
 
 def _state_path() -> Path:
-    try:
-        from hermes_constants import get_hermes_home
-        home = Path(get_hermes_home())
-    except Exception:
-        home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
-    return home / "credential-pool-switcher-state.json"
+    return _hermes_home() / "credential-pool-switcher-state.json"
 
 
 def _read_state() -> dict:

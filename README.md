@@ -123,9 +123,17 @@ hermes credential-pool-switcher status
 
 ## Auto rotation
 
-Automatic by default — add the accounts, nothing else. While Hermes is in use, a `pre_llm_call` hook starts a background run at most every 10 minutes (shared across the gateway, CLI and desktop app through a small state file, `credential-pool-switcher-state.json` in the Hermes home: timestamps and the last result, no credentials). A run reads each login's usage (5h, weekly, model-scoped) and moves the one with the most weekly headroom to priority 0. It keeps the current login unless the winner is at least 5 points better, so two similar logins do not swap back and forth. Logins at 100% in any window, benched by Hermes, dead, or without usage data are left alone.
+**Opt-in, off by default.** Background rotation changes which account is billed, so it only runs after you enable it in `config.yaml` (not via `.env`):
 
-- Turn it off: `HERMES_CPS_AUTO_ROTATE=0` in the environment of the Hermes process.
+```yaml
+plugins:
+  credential-pool-switcher:
+    auto_rotate: true
+```
+
+Once enabled, while Hermes is in use, a `pre_llm_call` hook starts a background run at most every 10 minutes (shared across the gateway, CLI and desktop app through a small state file, `credential-pool-switcher-state.json` in the Hermes home: timestamps and the last result, no credentials). A run reads each login's usage (5h, weekly, model-scoped) and moves the one with the most weekly headroom to priority 0. It keeps the current login unless the winner is at least 5 points better, so two similar logins do not swap back and forth. Logins at 100% in any window, benched by Hermes, dead, or without usage data are left alone.
+
+- Turn it off again: remove the setting or set `auto_rotate: false` (the default).
 - Run it by hand: `/switch auto [--dry-run]`, `hermes credential-pool-switcher auto`, or **Auto-rotate now** in the chip popover.
 - A cron job is optional: it only helps if Hermes sits idle for long stretches.
 

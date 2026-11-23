@@ -68,7 +68,7 @@ const MESSAGES = {
     autoDone: 'Auto rotation finished',
     autoFailed: (msg) => `Auto rotation failed: ${msg}`,
     autoOn: (mins, last) => `Auto-switch on \u00b7 every ${mins} min` + (last ? ` \u00b7 last check ${last}` : ''),
-    autoOff: 'Auto-switch off (HERMES_CPS_AUTO_ROTATE=0)',
+    autoOff: 'Auto-switch off (opt in: plugins.credential-pool-switcher.auto_rotate)',
     loadFailed: 'Account switcher unavailable',
     retry: 'click to retry'
   },
@@ -102,7 +102,7 @@ const MESSAGES = {
     autoDone: 'Auto-Rotation fertig',
     autoFailed: (msg) => `Auto-Rotation fehlgeschlagen: ${msg}`,
     autoOn: (mins, last) => `Auto-Switch an \u00b7 alle ${mins} Min.` + (last ? ` \u00b7 zuletzt gepr\u00fcft ${last}` : ''),
-    autoOff: 'Auto-Switch aus (HERMES_CPS_AUTO_ROTATE=0)',
+    autoOff: 'Auto-Switch aus (aktivieren: plugins.credential-pool-switcher.auto_rotate)',
     loadFailed: 'Account-Switcher nicht erreichbar',
     retry: 'Klick = erneut versuchen'
   }

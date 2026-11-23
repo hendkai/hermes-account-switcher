@@ -29,6 +29,8 @@ def mod(tmp_path, monkeypatch):
     spec.loader.exec_module(m)
     m._state_path = lambda: tmp_path / "state.json"  # never touch the real Hermes home
     monkeypatch.delenv("HERMES_CPS_AUTO_ROTATE", raising=False)
+    m._test_config = {}  # what the fake load_config() returns; default = nothing configured
+    _fake_module(monkeypatch, "hermes_cli.config", load_config=lambda: m._test_config)
     yield m
     sys.modules.pop(spec.name, None)
 
@@ -50,6 +52,10 @@ def _fake_module(monkeypatch, dotted: str, **attrs):
     parent_mod = sys.modules[".".join(parts[:-1])]
     monkeypatch.setattr(parent_mod, parts[-1], fake, raising=False)
     return fake
+
+
+def _opt_in(mod, value=True):
+    mod._test_config = {"plugins": {"credential-pool-switcher": {"auto_rotate": value}}}
 
 
 def _iso(epoch: float) -> str:
@@ -384,6 +390,7 @@ def test_auto_swaps_when_clearly_better_and_reports_changed(mod, monkeypatch):
 
 
 def test_maybe_auto_rotate_is_throttled_across_calls(mod, monkeypatch):
+    _opt_in(mod)
     runs = []
     monkeypatch.setattr(mod, "auto_rotate", lambda provider="anthropic", dry_run=False:
                         runs.append(provider) or {"ok": True, "promoted": "a@x"})
@@ -396,17 +403,47 @@ def test_maybe_auto_rotate_is_throttled_across_calls(mod, monkeypatch):
     assert info["enabled"] is True and info["last_promoted"] == "a@x" and info["last_error"] is None
 
 
-def test_maybe_auto_rotate_respects_opt_out(mod, monkeypatch):
-    monkeypatch.setenv("HERMES_CPS_AUTO_ROTATE", "0")
-    monkeypatch.setattr(mod, "auto_rotate", lambda *a, **k: pytest.fail("opted out"))
+def test_auto_rotation_is_off_by_default(mod, monkeypatch):
+    """Reviewer requirement: background rotation must be opt-in."""
+    monkeypatch.setattr(mod, "auto_rotate", lambda *a, **k: pytest.fail("not opted in"))
+    assert mod.auto_enabled() is False
     assert mod.maybe_auto_rotate(background=False) is False
     assert mod.auto_info()["enabled"] is False
+
+
+def test_auto_rotation_ignores_env_var(mod, monkeypatch):
+    """The old default-on env switch is gone: .env is for secrets only."""
+    monkeypatch.setenv("HERMES_CPS_AUTO_ROTATE", "1")
+    assert mod.auto_enabled() is False
+
+
+def test_auto_rotation_opt_in_via_config_yaml(mod, monkeypatch):
+    calls = []
+    monkeypatch.setattr(mod, "auto_rotate", lambda *a, **k: calls.append(1) or {"promoted": None})
+    _opt_in(mod, True)
+    assert mod.auto_enabled() is True
+    assert mod.maybe_auto_rotate(background=False, now=7_000_000.0) is True
+    assert calls == [1]
+    _opt_in(mod, "true")
+    assert mod.auto_enabled() is True
+    for off in (False, "false", "0", None):
+        _opt_in(mod, off)
+        assert mod.auto_enabled() is False
+
+
+def test_auto_enabled_survives_broken_config(mod, monkeypatch):
+    def boom():
+        raise RuntimeError("config unreadable")
+    _fake_module(monkeypatch, "hermes_cli.config", load_config=boom)
+    monkeypatch.setattr(mod, "_hermes_home", lambda: Path("/nonexistent-dir-cps"))
+    assert mod.auto_enabled() is False
 
 
 def test_auto_worker_failure_is_recorded_not_raised(mod, monkeypatch):
     def boom(*a, **k):
         raise RuntimeError("usage down")
     monkeypatch.setattr(mod, "auto_rotate", boom)
+    _opt_in(mod)
     assert mod.maybe_auto_rotate(background=False, now=5_000_000.0) is True
     assert mod.auto_info()["last_error"] == "RuntimeError"
     assert mod._auto_running is False  # slot released, next interval can run
