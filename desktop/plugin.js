@@ -66,6 +66,7 @@ const MESSAGES = {
     scoped: 'model',
     usageLoading: 'Loading usage\u2026',
     usageUnavailable: 'Usage unavailable right now',
+    usageError: 'Usage could not be read \u2014 the credential pool was unavailable',
     switched: (label) => `Claude account switched: ${label} is used first`,
     switchFailed: (msg) => `Switch failed: ${msg}`,
     switchUnverified: (label) => `${label} was moved, but the switcher could not confirm it is used first — check the list.`,
@@ -103,6 +104,7 @@ const MESSAGES = {
     scoped: 'Modell',
     usageLoading: 'Lade Nutzung\u2026',
     usageUnavailable: 'Nutzung gerade nicht verf\u00fcgbar',
+    usageError: 'Nutzung nicht lesbar \u2014 der Credential-Pool war nicht erreichbar',
     switched: (label) => `Claude-Account gewechselt: ${label} wird zuerst genutzt`,
     switchFailed: (msg) => `Wechsel fehlgeschlagen: ${msg}`,
     switchUnverified: (label) => `${label} wurde verschoben, aber der Switcher konnte nicht best\u00e4tigen, dass er zuerst genutzt wird — Liste pr\u00fcfen.`,
@@ -349,10 +351,14 @@ function Panel({ status, t }) {
                 ]
               }))
           }),
-      status.state !== 'setup' && usage.isFetching && !usage.data
-        ? jsx('p', { className: 'text-(--ui-text-tertiary)', children: t('usageLoading') })
-        : null,
-      status.state !== 'setup' && !usage.isFetching && !hasUsage && status.count
+      status.state !== 'setup' && usage.isError
+        // The --usage call failed outright (e.g. the pool could not be re-read): its own
+        // wording, distinct from ordinary "no usage data".
+        ? jsx('p', { className: 'text-(--ui-text-secondary)', children: t('usageError') })
+        : status.state !== 'setup' && usage.isFetching && !usage.data
+          ? jsx('p', { className: 'text-(--ui-text-tertiary)', children: t('usageLoading') })
+          : null,
+      status.state !== 'setup' && !usage.isError && !usage.isFetching && !hasUsage && status.count
         ? jsx('p', { className: 'text-(--ui-text-tertiary)', children: t('usageUnavailable') })
         : null,
       status.state === 'exhausted' && status.next_ready_at

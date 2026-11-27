@@ -626,7 +626,8 @@ def test_manual_switch_can_still_override_a_benched_or_unknown_cooldown_login(mo
     monkeypatch.setattr(mod, "_pool_strategy", lambda p: "fill_first")
     moved = []
     monkeypatch.setattr(mod, "_move_to_front", lambda p, a, **k: moved.append(a.id))
-    monkeypatch.setattr(mod, "list_accounts", lambda *a, **k: {"accounts": []})
+    monkeypatch.setattr(mod, "list_accounts", lambda *a, **k: {"accounts": [
+        {"label": "u@x", "id": "id1", "priority": 0}, {"label": "a@x", "id": "id0", "priority": 1}]})
     plan = mod.switch("u@x")
     assert moved == ["id1"] and plan["ok"] is True and "cooldown is unknown" in plan["warning"]
     # the same login is declined only when the caller asks for the eligibility check
@@ -770,7 +771,8 @@ def test_switch_require_eligible_declines_cli_text_rows_without_moving(mod, monk
     # a manual switch is unchanged
     moved = []
     monkeypatch.setattr(mod, "_move_to_front", lambda p, a, **k: moved.append(a.id))
-    monkeypatch.setattr(mod, "list_accounts", lambda *a, **k: {"accounts": []})
+    monkeypatch.setattr(mod, "list_accounts", lambda *a, **k: {"accounts": [
+        {"label": "fresh@x", "id": "id1", "priority": 0}, {"label": "busy@x", "id": "id0", "priority": 1}]})
     assert mod.switch("fresh@x")["ok"] is True and moved == ["id1"]
 
 
@@ -863,16 +865,31 @@ def test_exact_id_move_never_falls_back_to_the_label_resolving_cli(mod, monkeypa
     assert mod._move_to_front("anthropic", acct) is None
 
 
-def test_exact_id_verification_ignores_a_label_only_match(mod, monkeypatch):
+def test_switch_verification_compares_the_resolved_entry_id_only(mod, monkeypatch):
+    """Astra round 5: two accounts with the same label must not yield a false
+    verified_first / CPS_RESULT ok when a *different* entry id is priority 0 — on the
+    exact-id path AND on the friendly label path (the old test expected that false
+    positive here)."""
     accts = [_acct(mod, 0, "busy@x"), _acct(mod, 1, "fresh@x")]
     monkeypatch.setattr(mod, "_read_accounts", lambda p: (p, accts))
     monkeypatch.setattr(mod, "_pool_strategy", lambda p: "fill_first")
-    monkeypatch.setattr(mod, "_move_to_front", lambda *a, **k: None)
+    moved = []
+    monkeypatch.setattr(mod, "_move_to_front", lambda p, a, **k: moved.append(a.id))
     # a different entry that merely carries the same label sits at priority 0
     monkeypatch.setattr(mod, "list_accounts", lambda *a, **k: {"accounts": [
         {"label": "fresh@x", "id": "idOTHER", "priority": 0}, {"label": "fresh@x", "id": "id1", "priority": 1}]})
     assert mod.switch("id1", exact_id=True)["verified_first"] is False
-    assert mod.switch("fresh@x")["verified_first"] is True  # manual path keeps its label tolerance
+    manual = mod.switch("fresh@x")  # friendly path resolves id1 — must NOT verify on the label twin
+    assert manual["ok"] is False and manual["unverified"] is True and manual["verified_first"] is False
+    assert "may or may not have changed" in manual["error"]
+    assert "Switch unverified" in mod.render_switch(manual) and "Switched" not in mod.render_switch(manual)
+    assert mod._switch_outcome(manual) == "unverified"
+    # the same resolved id first again → verified, and ok stays true
+    moved.clear()
+    monkeypatch.setattr(mod, "list_accounts", lambda *a, **k: {"accounts": [
+        {"label": "fresh@x", "id": "id1", "priority": 0}, {"label": "busy@x", "id": "id0", "priority": 1}]})
+    ok = mod.switch("fresh@x")
+    assert ok["ok"] is True and ok["verified_first"] is True and moved == ["id1"]
 
 
 def test_auto_uses_the_exact_id_path_and_reports_unverified_moves(mod, monkeypatch):
@@ -1284,7 +1301,8 @@ def test_switch_require_eligible_declines_a_non_oauth_winner_before_moving(mod, 
     assert out["ok"] is False and out["declined"] is True and "OAuth" in out["reason"]
     # manual switch is unchanged
     monkeypatch.setattr(mod, "_move_to_front", lambda *a, **k: None)
-    monkeypatch.setattr(mod, "list_accounts", lambda *a, **k: {"accounts": []})
+    monkeypatch.setattr(mod, "list_accounts", lambda *a, **k: {"accounts": [
+        {"label": "key@x", "id": "id1", "priority": 0}, {"label": "busy@x", "id": "id0", "priority": 1}]})
     assert mod.switch("key@x")["ok"] is True
 
 
@@ -1393,7 +1411,10 @@ const out = {
   rowWithoutId: rowSwitchArgv({ label: 'b@x' }),
   rowEmptyId: rowSwitchArgv({ id: '', label: 'b@x' }),
   step3en: MESSAGES.en.step3,
-  step3de: MESSAGES.de.step3
+  step3de: MESSAGES.de.step3,
+  usageErrorEn: MESSAGES.en.usageError,
+  usageErrorDe: MESSAGES.de.usageError,
+  usageUnavailableEn: MESSAGES.en.usageUnavailable
 }
 console.log(JSON.stringify(out))
 """
@@ -1415,3 +1436,193 @@ console.log(JSON.stringify(out))
     assert out["rowWithoutId"] is None and out["rowEmptyId"] is None
     assert "off by default" in out["step3en"] and "standardm" in out["step3de"]
     assert "by itself" not in out["step3en"] and "selbst" not in out["step3de"]
+    # a failed --usage read has its own wording, distinct from ordinary no-usage
+    assert "could not be read" in out["usageErrorEn"] and "nicht lesbar" in out["usageErrorDe"]
+    assert out["usageErrorEn"] != out["usageUnavailableEn"]
+    assert "usage.isError" in PLUGIN_JS.read_text() and "t('usageError')" in PLUGIN_JS.read_text()
+
+
+# -- Astra round 5: source revalidation, id-only verification, unverified
+#    non-success results, explicit pool-read errors on the usage snapshot,
+#    fixed diagnostics, and the operator-approved read accessor --------------------
+
+
+def test_move_declines_when_the_winner_became_a_borrowed_source(mod, monkeypatch):
+    """Source-only change: still OAuth, alive, not benched — but the row turned claude_code."""
+    moved = []
+    entries = [_pool_entry(0, "busy@x"), _pool_entry(1, "fresh@x", source="claude_code")]
+    monkeypatch.setattr(mod, "_load_writable_pool", lambda p: _writable(entries, moved))
+    out = mod._move_to_front("anthropic", _acct(mod, 1, "fresh@x"), exact_id=True, require_eligible=True)
+    assert isinstance(out, mod._MoveDeclined) and "own auth flows" in out and "claude_code" in out
+    assert moved == []
+
+
+def test_auto_declines_a_winner_that_became_borrowed_between_reads(mod, monkeypatch):
+    """Ranked as pool-owned on the first read; the pool used for the move now shows claude_code."""
+    accts = [_acct(mod, 0, "busy@x"), _acct(mod, 1, "fresh@x")]
+    monkeypatch.setattr(mod, "_read_accounts", lambda p: (p, accts))
+    monkeypatch.setattr(mod, "_usage_for_accounts", lambda accs, p: _by_id(accts, {
+        "busy@x": _usage(week=90), "fresh@x": _usage(week=0)}))
+    monkeypatch.setattr(mod, "_pool_strategy", lambda p: "fill_first")
+    moved = []
+    changed = [_pool_entry(0, "busy@x"), _pool_entry(1, "fresh@x", source="claude_code")]
+    monkeypatch.setattr(mod, "_load_writable_pool", lambda p: _writable(changed, moved))
+    monkeypatch.setattr(mod, "list_accounts", lambda *a, **k: pytest.fail("no verification read after a decline"))
+    report = mod.auto_rotate()
+    assert moved == []
+    assert report["declined"]["account"] == "fresh@x" and "claude_code" in report["declined"]["reason"]
+    assert report["promoted"] is None and not report.get("changed") and report["ok"] is True
+    assert "order unchanged" in mod.render_auto(report)
+
+
+def test_switch_require_eligible_declines_a_borrowed_winner_before_moving(mod, monkeypatch):
+    rows = [_acct(mod, 0, "busy@x"), _acct(mod, 1, "cc@x", source="claude_code")]
+    monkeypatch.setattr(mod, "_read_accounts", lambda p: (p, rows))
+    monkeypatch.setattr(mod, "_pool_strategy", lambda p: "fill_first")
+    monkeypatch.setattr(mod, "_move_to_front", lambda *a, **k: pytest.fail("a borrowed winner must not move"))
+    out = mod.switch("id1", require_eligible=True, exact_id=True)
+    assert out["ok"] is False and out["declined"] is True and "claude_code" in out["reason"]
+
+
+def test_switch_read_back_failure_is_unverified_not_success(mod, monkeypatch, capsys):
+    """A missing read-back after a real move: attempted, unverified, never ok / never
+    claimed as done — and the wording does not imply the move was rolled back."""
+    accts = [_acct(mod, 0, "busy@x"), _acct(mod, 1, "fresh@x")]
+    monkeypatch.setattr(mod, "_read_accounts", lambda p: (p, accts))
+    monkeypatch.setattr(mod, "_pool_strategy", lambda p: "fill_first")
+    moved = []
+    monkeypatch.setattr(mod, "_move_to_front", lambda p, a, **k: moved.append(a.id))
+
+    def boom(*a, **k):
+        raise mod.PoolReadError("could not read the anthropic credential pool (OSError)")
+
+    monkeypatch.setattr(mod, "list_accounts", boom)
+    plan = mod.switch("fresh@x")
+    assert moved == ["id1"]                      # the move was attempted
+    assert plan["ok"] is False and plan["unverified"] is True and plan["verified_first"] is False
+    assert "could not be read back" in plan["error"] and "may or may not have changed" in plan["error"]
+    assert mod._switch_outcome(plan) == "unverified"
+    text = mod.render_switch(plan)
+    assert "Switch unverified" in text and "Switched" not in text
+    # the tool result carries the non-success too
+    out = json.loads(mod._tool_account_switch({"action": "switch", "target": "fresh@x"}))
+    assert out["ok"] is False and out["unverified"] is True
+    # and the CLI exits nonzero on CPS_RESULT unverified
+    with pytest.raises(SystemExit) as ei:
+        mod._handle_cli(SimpleNamespace(cmd="switch", target="fresh@x", provider="anthropic",
+                                        dry_run=False, exact_id=False))
+    lines = capsys.readouterr().out.strip().splitlines()
+    assert ei.value.code == 1 and lines[-1] == "CPS_RESULT unverified"
+
+
+def test_auto_worker_claims_first_only_when_verified(mod, monkeypatch, caplog):
+    """changed without a promoted name (unverified) must not log 'now tried first'."""
+    monkeypatch.setattr(mod, "auto_rotate", lambda p="anthropic", dry_run=False: {
+        "ok": False, "changed": True, "promoted": None, "unverified": True,
+        "error": "promotion could not be verified by entry id"})
+    with caplog.at_level("INFO", logger="credential_pool_switcher"):
+        mod._auto_worker("anthropic")
+    assert "now tried first" not in caplog.text
+    info = mod.auto_info()
+    assert info["last_promoted"] is None and "could not be verified" in info["last_error"]
+    # a verified promotion still claims it
+    monkeypatch.setattr(mod, "auto_rotate", lambda p="anthropic", dry_run=False: {
+        "ok": True, "changed": True, "promoted": "a@x"})
+    caplog.clear()
+    with caplog.at_level("INFO", logger="credential_pool_switcher"):
+        mod._auto_worker("anthropic")
+    assert "a@x is now tried first" in caplog.text
+
+
+def test_usage_snapshot_pool_read_error_propagates_and_stays_distinct(mod, monkeypatch, capsys):
+    """A PoolReadError on the second (token) snapshot surfaces as an explicit error
+    through auto/tool/CLI — never as silent no-usage success. Ordinary no-usage
+    (helper missing) stays None and keeps auto's ok/no_usage reporting."""
+    accounts = [_acct(mod, 0, "ok@x")]
+    monkeypatch.setattr(mod, "_read_accounts", lambda p: (p, accounts))
+    monkeypatch.setattr(mod, "_pool_strategy", lambda p: "fill_first")
+    _fake_module(monkeypatch, "agent.account_usage",
+                 fetch_account_usage=lambda *a, **k: pytest.fail("no token may be probed when the snapshot is unreadable"))
+
+    def unreadable(p):
+        raise mod.PoolReadError("could not read the anthropic credential pool (OSError)")
+
+    monkeypatch.setattr(mod, "_load_pool", unreadable)
+    with pytest.raises(mod.PoolReadError):
+        mod._usage_for_accounts(accounts)     # the token snapshot read failed
+    with pytest.raises(mod.PoolReadError):
+        mod.list_accounts("anthropic")        # first read ok, second fails → command fails closed
+    with pytest.raises(mod.PoolReadError):
+        mod.pool_status(with_usage=True)
+    assert mod.pool_status()["usage_available"] is False  # without --usage nothing is fetched
+    # auto fails closed before any move
+    monkeypatch.setattr(mod, "switch", lambda *a, **k: pytest.fail("no usage: nothing may move"))
+    with pytest.raises(mod.PoolReadError):
+        mod.auto_rotate()
+    out = json.loads(mod._tool_account_switch({"action": "auto"}))
+    assert out["ok"] is False and "nothing was changed" in out["error"]
+    for cmd, ns in (("auto", SimpleNamespace(cmd="auto", provider="anthropic", dry_run=False)),
+                    ("list", SimpleNamespace(cmd="list", provider="anthropic")),
+                    ("status", SimpleNamespace(cmd="status", provider="anthropic", json=True, usage=True))):
+        with pytest.raises(SystemExit) as ei:
+            mod._handle_cli(ns)
+        assert ei.value.code == 1, cmd
+    printed = capsys.readouterr().out
+    assert "Auto rotation failed" in printed and "Command failed" in printed
+    assert "nothing was changed" in printed
+    # ordinary no-usage (helper not importable) is still just "no usage": None, no raise
+    _fake_module(monkeypatch, "agent.account_usage")  # module without fetch_account_usage
+    monkeypatch.setattr(mod, "_load_pool", lambda p: _snap([_pool_entry(0, "ok@x", token="t")]))
+    assert mod._usage_for_accounts(accounts) is None
+    report = mod.auto_rotate()
+    assert report["ok"] is True and report["unknown_reason"] == {"ok@x": "no_usage"}
+
+
+def test_cli_fallback_failure_returns_a_fixed_message_not_subprocess_output(mod, monkeypatch):
+    monkeypatch.setattr(mod, "_load_writable_pool", lambda p: None)
+    secret = "***"
+    monkeypatch.setattr(mod, "_run", lambda args: f"Error: invalid key {secret}")
+    out = mod._move_to_front("anthropic", _acct(mod, 1, "b@x"))
+    assert secret not in out
+    assert "failed" in out and "may or may not have changed" in out
+
+
+def test_move_failure_diagnostics_carry_the_exception_class_only(mod, monkeypatch, caplog):
+    def boom(_id, _pos):
+        raise RuntimeError("boom ***")
+
+    entries = [_pool_entry(0, "busy@x"), _pool_entry(1, "fresh@x")]
+    monkeypatch.setattr(mod, "_load_writable_pool",
+                        lambda p: SimpleNamespace(move_entry=boom, entries=lambda: entries))
+    # strict: the returned message names the exception class, never the exception text
+    out = mod._move_to_front("anthropic", _acct(mod, 1, "fresh@x"), exact_id=True)
+    assert "RuntimeError" in out and "***" not in out
+    # non-strict: the retry warning logs the class only, then the CLI fallback runs
+    caplog.clear()
+    monkeypatch.setattr(mod, "_run", lambda args: "Set anthropic credential x to priority 0")
+    with caplog.at_level("DEBUG", logger="credential_pool_switcher"):
+        assert mod._move_to_front("anthropic", _acct(mod, 1, "fresh@x")) is None
+    assert "RuntimeError" in caplog.text and "***" not in caplog.text
+
+
+def test_no_raw_exception_or_subprocess_output_in_diagnostics(mod):
+    """Every log/return of a failure carries a fixed message or the exception class."""
+    src = PLUGIN_FILE.read_text()
+    assert "out[:200]" not in src               # the old truncated CLI-output echo
+    assert "hermes auth priority failed: {" not in src
+    # no log call passes the exception object itself (class name only)
+    import re as _re
+    assert _re.search(r"log\.(debug|info|warning|error|exception)\(\s*[^)]*,\s*exc\s*[,)]", src) is None
+
+
+def test_reads_use_only_the_operator_approved_core_read_accessor(mod):
+    """Operator decision 2026-11-28: snapshot reads may go through core's
+    read_credential_pool accessor — and through nothing else that touches the auth
+    store. The accessor is called from exactly one place; direct auth-store helpers
+    stay forbidden in the source."""
+    tree = _ast.parse(PLUGIN_FILE.read_text())
+    name = lambda f: f.id if isinstance(f, _ast.Name) else (f.attr if isinstance(f, _ast.Attribute) else "")
+    assert _functions_calling(tree, lambda f: name(f) == "read_credential_pool") == {"_load_pool"}
+    src = PLUGIN_FILE.read_text()
+    for forbidden in ("write_credential_pool", "_load_auth_store", "_auth_store_lock", "_get_json"):
+        assert forbidden not in src, forbidden

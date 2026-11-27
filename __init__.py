@@ -23,7 +23,10 @@ How it touches Hermes:
 * **Switching** = "move to priority 0" through ``load_pool().move_entry()`` (the call
   behind ``hermes auth priority``): the only place the real pool is loaded. Auto
   rotation re-validates the exact id on that same pool object right before the move.
-  The account is tried first on the next model call (``fill_first`` strategy).
+  The account is tried first on the next model call (``fill_first`` strategy). A move
+  whose read-back cannot confirm the moved entry id at priority 0 returns
+  ``{"ok": False, "unverified": True, ...}`` (attempted, not verified, nothing rolled
+  back) — ``ok`` stays true only for verified moves, already-first no-ops and plans.
 * **Usage percentages** (list only) go through Hermes' public
   ``fetch_account_usage(read_only=True, identity_id=<entry id>)``. Only tokens of
   OAuth logins from Hermes' own auth flows (``manual*``, ``hermes_pkce`` ...) are sent
@@ -33,7 +36,9 @@ How it touches Hermes:
   dead, pool-owned): a login that turned borrowed, foreign or dead between the two
   reads keeps its token at home. No token is refreshed or rotated and no
   cooldown or bench state is written. Hermes' own usage cache may remember the
-  returned snapshot, per credential.
+  returned snapshot, per credential. When that token snapshot itself cannot be read,
+  a ``PoolReadError`` propagates (list/status/auto fail closed with an explicit
+  pool-read error) — it is never mistaken for ordinary "no usage data".
 * **Auto rotation** (``auto``) uses the same usage data and ``switch`` (the
   pool's ``move_entry``) to promote the login with the most headroom. It runs
   only when you opt in (``plugins.credential-pool-switcher.auto_rotate: true``
@@ -88,7 +93,8 @@ class Account:
     auth_type: str
     id: str
     priority: int
-    source: str
+    source: str           # display source ("manual:x" is shown as "x")
+    raw_source: str = ""  # the pool-row source exactly as stored; "" when the row was built by hand
     current: bool = False
     notes: List[str] = field(default_factory=list)
     status: str = "ok"                  # ok | exhausted | dead
@@ -350,7 +356,7 @@ def _load_writable_pool(provider: str):
     try:
         from agent.credential_pool import load_pool  # type: ignore
     except Exception as exc:
-        log.debug("agent.credential_pool not importable (%s)", exc)
+        log.debug("agent.credential_pool not importable (%s)", type(exc).__name__)
         return None
     try:
         return load_pool(provider)
@@ -365,7 +371,7 @@ def _pool_strategy(provider: str) -> str:
         from agent.credential_pool import get_pool_strategy  # type: ignore
         return str(get_pool_strategy(provider) or "")
     except Exception as exc:
-        log.debug("get_pool_strategy unavailable: %s", exc)
+        log.debug("get_pool_strategy unavailable: %s", type(exc).__name__)
         return ""
 
 
@@ -406,6 +412,7 @@ def _accounts_from_pool(pool) -> List[Account]:
             id=str(e.id),
             priority=int(getattr(e, "priority", idx - 1)),
             source=_display_source(str(getattr(e, "source", "") or "")),
+            raw_source=str(getattr(e, "source", "") or ""),
             notes=notes,
             status=status if status in (STATUS_EXHAUSTED, STATUS_DEAD) else "ok",
             bench_until=until,
@@ -499,7 +506,10 @@ def _usage_for_accounts(accounts: List[Account], provider: str = DEFAULT_PROVIDE
     simply shows no percentages.
     ``five_hour`` / ``week`` are account-level windows; ``scoped`` is the tightest
     model-family cap and is informational for model-agnostic decisions.
-    Returns ``{entry_id: {"five_hour": ..., "week": ..., "scoped": {...}}}`` or None.
+    Returns ``{entry_id: {"five_hour": ..., "week": ..., "scoped": {...}}}`` or None
+    (ordinary no-usage: helper missing, no tokens, every fetch failed). When the
+    token snapshot itself cannot be read, :class:`PoolReadError` propagates so callers
+    fail closed instead of mistaking it for "no usage data".
     Keys are stable credential entry ids, never display labels: labels can repeat.
     """
     wanted = {a.id for a in accounts
@@ -509,12 +519,12 @@ def _usage_for_accounts(accounts: List[Account], provider: str = DEFAULT_PROVIDE
     try:
         from agent.account_usage import fetch_account_usage
     except Exception as exc:
-        log.debug("agent.account_usage not importable: %s", exc)
+        log.debug("agent.account_usage not importable: %s", type(exc).__name__)
         return None
-    try:
-        pool = _load_pool(provider)
-    except PoolReadError:
-        return None
+    # The snapshot that actually supplies the tokens. A read failure here must not
+    # look like "no usage": auto would then report success without establishing
+    # anything, so the error propagates to the caller.
+    pool = _load_pool(provider)
     with_identity = _fetch_supports_identity(fetch_account_usage)
     out: dict = {}
     for entry_id, token in _usage_token_entries(pool.entries(), wanted):
@@ -674,7 +684,7 @@ def _notify_changed(provider: str) -> None:
         from hermes_cli.plugin_events import broadcast_plugin_event
         broadcast_plugin_event(PLUGIN_ID, "pool.changed", {"provider": provider})
     except Exception as exc:
-        log.debug("pool.changed broadcast skipped: %s", exc)
+        log.debug("pool.changed broadcast skipped: %s", type(exc).__name__)
 
 
 def _is_benched(account: Account, now: float) -> bool:
@@ -818,21 +828,30 @@ def _move_to_front(provider: str, account: Account, *, exact_id: bool = False,
         except Exception as exc:
             if strict:
                 return f"pool.move_entry failed ({type(exc).__name__}); not retrying by label"
-            log.warning("pool.move_entry failed (%s); retrying via `hermes auth priority`", exc)
+            # Exception texts can embed provider payloads: log the class only.
+            log.warning("pool.move_entry failed (%s); retrying via `hermes auth priority`",
+                        type(exc).__name__)
     if strict:
         return "the pool cannot be accessed directly; an exact-id, re-validated move is not possible"
     out = _run(["auth", "priority", provider, account.id, "0"])
     if not re.search(r"^Set \S+ credential ", out, re.M):
-        return f"hermes auth priority failed: {out[:200]}"
+        # Fixed message only: the CLI's own output is never echoed back or logged
+        # (it can quote credential material or paths).
+        return ("the manual CLI move (`hermes auth priority`) failed; "
+                "the order may or may not have changed — check /switch list")
     return None
 
 
 def _ineligible_reason(account: Account, now: float) -> Optional[str]:
     """Why *account* may not be promoted automatically right now, or None.
 
-    Used only for the strict (auto rotation) path, where the winner must still be an
-    OAuth login that Hermes would use: not an API key, not dead, not benched.
+    Used only for the strict (auto rotation) path, where the winner must still be a
+    login Hermes itself created and would use: a pool-owned OAuth login (a row that
+    turned borrowed since ranking — e.g. its source is now ``claude_code`` — is not
+    ours to promote), not an API key, not dead, not benched.
     """
+    if not _is_pool_owned_source(account.raw_source or account.source):
+        return f"no longer a login from Hermes' own auth flows (source is now {account.source or 'unknown'})"
     if account.auth_type != "oauth":
         return f"no longer an OAuth login (now {account.auth_type or 'unknown'})"
     if account.status == STATUS_DEAD:
@@ -842,6 +861,21 @@ def _ineligible_reason(account: Account, now: float) -> Optional[str]:
     if _is_benched(account, now):
         return "benched by Hermes until its reset"
     return None
+
+
+def _as_unverified(plan: dict, detail: str) -> dict:
+    """Mark a plan whose move was attempted (or may have run) but not confirmed: NOT a success.
+
+    ``ok`` becomes False so no caller — tool, slash, CLI, desktop, background worker —
+    can treat an attempted-but-unverified move as done; ``unverified`` distinguishes it
+    from a refused or failed one. The order may or may not have changed: nothing is
+    implied about rollback, because nothing is rolled back.
+    """
+    plan["ok"] = False
+    plan["unverified"] = True
+    plan["verified_first"] = False
+    plan["error"] = detail
+    return plan
 
 
 def switch(
@@ -867,6 +901,11 @@ def switch(
     post-move check compares ids only. A vanished or ambiguous id fails closed.
     With ``require_eligible`` the pool object used for the move itself is re-validated
     (see :func:`_move_to_front`), so a state change after the first read declines.
+
+    The post-move verification compares the **resolved entry id** only — labels can
+    repeat, so a label match at priority 0 never counts. A move whose read-back is
+    missing or confirms a different id returns ``{"ok": False, "unverified": True, ...}``
+    (attempted, not verified; nothing rolled back), never ``ok: True``.
     """
     _, accounts = _read_accounts(provider)
     if not accounts:
@@ -934,18 +973,21 @@ def switch(
     _notify_changed(provider)
 
     # Verification only needs the order — no usage fetch (the usage endpoint 429s).
+    # The comparison is by resolved entry id only: two accounts may share a label, and
+    # a label match at priority 0 could be the other one.
     try:
         after = list_accounts(provider, with_usage=False)
-    except PoolReadError:
-        plan["order_after"] = []
-        plan["verified_first"] = False
-        return plan
+    except PoolReadError as exc:
+        return _as_unverified(
+            plan, f"the move was attempted, but the new order could not be read back to "
+                  f"confirm it ({exc}); the order may or may not have changed. Check /switch list.")
     active = next((a for a in after["accounts"] if a["priority"] == 0), None)
     plan["order_after"] = [a["label"] for a in after["accounts"]]
-    if exact_id:
-        plan["verified_first"] = bool(active and active["id"] == account.id)
-    else:
-        plan["verified_first"] = bool(active and (active["label"] == account.label or active["id"] == account.id))
+    if active is None or active["id"] != account.id:
+        return _as_unverified(
+            plan, "the move was attempted, but priority 0 is now a different entry "
+                  "(entry ids are compared); the order may or may not have changed. Check /switch list.")
+    plan["verified_first"] = True
     return plan
 
 
@@ -979,13 +1021,18 @@ def auto_rotate(provider: str = DEFAULT_PROVIDER, *, dry_run: bool = False) -> d
 
     Reads usage through the public helper and reorders with :func:`switch`
     (the pool's ``move_entry``) with ``require_eligible``: the pool is re-read right
-    before the move and a winner that is now dead, benched or of unknown cooldown is
+    before the move and a winner that is now dead, benched, borrowed (a source that is
+    no longer one of Hermes' own auth flows) or of unknown cooldown is
     declined (``report["declined"]``), not moved. It never benches, refreshes or writes tokens,
     and sends no message request: a login Hermes' own pool benched after a 429
     is only skipped here. Ranking uses account-level windows only (5h, week); a
     model-family cap is reported (``scoped_caps``) but does not exclude a login.
     "Has headroom" means usage-eligible, not verified by a message. Logins with
     scoped-only usage data, or exhausted without a stored reset, are never promoted.
+    When the pool cannot be re-read for the usage tokens, the run fails with an
+    explicit :class:`PoolReadError` (nothing moved) instead of reporting success
+    without usage; an attempted move that cannot be verified by entry id is reported
+    as ``ok: False`` with ``unverified``/``changed`` set, never as a promotion.
     """
     if provider != DEFAULT_PROVIDER:
         return {"ok": False, "error": f"auto rotation supports 'anthropic' (got '{provider}')."}
@@ -1061,12 +1108,15 @@ def auto_rotate(provider: str = DEFAULT_PROVIDER, *, dry_run: bool = False) -> d
         else:
             # The usage fetch took time and the pool may have changed since the first
             # read: switch() re-reads it and declines a login that is now dead,
-            # benched or of unknown cooldown (a manual switch would only warn).
+            # benched, borrowed or of unknown cooldown (a manual switch would only warn).
             # best.id is an entry id: exact-id path (no label/prefix match, no CLI move).
             plan = switch(best.id, provider, require_eligible=True, exact_id=True)
-            if plan.get("ok") and plan.get("verified_first") is False:
-                report["changed"] = True  # the move ran, but this entry is not first by id
+            if plan.get("unverified"):
+                # The move was attempted but not confirmed by entry id: never report
+                # success or a promotion — the order may or may not have changed.
+                report["changed"] = True
                 report["ok"] = False
+                report["unverified"] = True
                 report["error"] = "promotion could not be verified by entry id"
             elif plan.get("ok"):
                 report["promoted"] = name_of[best.id]
@@ -1150,7 +1200,7 @@ def _write_state(update: dict) -> None:
         tmp.write_text(json.dumps({**_read_state(), **update}))
         os.replace(tmp, path)
     except Exception as exc:
-        log.debug("state file not written: %s", exc)
+        log.debug("state file not written: %s", type(exc).__name__)
 
 
 def auto_info() -> dict:
@@ -1175,10 +1225,12 @@ def _auto_worker(provider: str) -> None:
             "last_promoted": report.get("promoted"),
             "last_error": None if report.get("ok") else report.get("error"),
         })
-        if report.get("changed"):
+        # Only a VERIFIED promotion may claim "now tried first": an unverified move
+        # (changed without a promoted name) may not have taken effect at all.
+        if report.get("changed") and report.get("promoted"):
             log.info("auto rotation: %s is now tried first", report.get("promoted"))
     except Exception as exc:  # a failed run must never reach the model call
-        log.debug("auto rotation failed: %s", exc)
+        log.debug("auto rotation failed: %s", type(exc).__name__)
         _write_state({"last_finished": time.time(), "last_error": f"{type(exc).__name__}"})
     finally:
         with _auto_lock:
@@ -1269,7 +1321,7 @@ def render_list(data: dict, markdown: bool = False) -> str:
 
 def render_switch(plan: dict, markdown: bool = False) -> str:
     b = "**" if markdown else ""
-    if not plan.get("ok"):
+    if not plan.get("ok") and not plan.get("unverified"):
         return f"{b}Switch failed{b}: {plan.get('error')}"
     if plan.get("dry_run"):
         lines = [
@@ -1279,10 +1331,12 @@ def render_switch(plan: dict, markdown: bool = False) -> str:
     elif plan.get("already_first"):
         lines = [f"{b}No change{b}: {plan['account']} is already priority 0."]
     elif not plan.get("verified_first"):
-        # Never claim a switch that could not be confirmed (by id where an exact id was asked).
+        # Never claim a switch that could not be confirmed by entry id. The move was
+        # attempted; the order may or may not have changed — nothing is rolled back.
         lines = [
             f"{b}Switch unverified{b}: {plan['account']} was asked to move to priority 0, "
-            "but it could not be confirmed as first in the rotation order. Check /switch list."
+            "but the new order could not be confirmed with that entry first "
+            "(entry ids are compared). The order may or may not have changed; check /switch list."
         ]
         if plan.get("order_after"):
             lines.append("Order read back: " + " → ".join(plan["order_after"]))
@@ -1496,6 +1550,8 @@ RESULT_PREFIX = "CPS_RESULT "  # last line of switch / plan / auto: ``ok`` | ``f
 
 def _switch_outcome(plan: dict) -> str:
     """``ok`` only for a plan, an already-first no-op, or a move confirmed first by read-back."""
+    if plan.get("unverified"):
+        return "unverified"  # a move was attempted but could not be confirmed: not a success
     if not plan.get("ok"):
         return "failed"
     if plan.get("dry_run") or plan.get("already_first"):
