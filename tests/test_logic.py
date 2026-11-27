@@ -152,7 +152,7 @@ def test_switch_verifies_without_usage_and_warns(mod, monkeypatch):
     monkeypatch.setattr(mod, "_read_accounts", lambda p: (p, accounts))
     monkeypatch.setattr(mod, "_pool_strategy", lambda p: "round_robin")
     moved = []
-    monkeypatch.setattr(mod, "_move_to_front", lambda p, a: moved.append(a.id))
+    monkeypatch.setattr(mod, "_move_to_front", lambda p, a, **k: moved.append(a.id))
     seen = {}
 
     def fake_list(provider="anthropic", with_usage=True):
@@ -640,7 +640,7 @@ def test_manual_switch_can_still_override_a_benched_or_unknown_cooldown_login(mo
     monkeypatch.setattr(mod, "_read_accounts", lambda p: (p, accounts))
     monkeypatch.setattr(mod, "_pool_strategy", lambda p: "fill_first")
     moved = []
-    monkeypatch.setattr(mod, "_move_to_front", lambda p, a: moved.append(a.id))
+    monkeypatch.setattr(mod, "_move_to_front", lambda p, a, **k: moved.append(a.id))
     monkeypatch.setattr(mod, "list_accounts", lambda *a, **k: {"accounts": []})
     plan = mod.switch("u@x")
     assert moved == ["id1"] and plan["ok"] is True and "cooldown is unknown" in plan["warning"]
@@ -657,7 +657,7 @@ def test_auto_moves_winner_that_is_still_eligible_on_the_fresh_read(mod, monkeyp
         "busy@x": _usage(week=90), "fresh@x": _usage(week=0)}))
     monkeypatch.setattr(mod, "_pool_strategy", lambda p: "fill_first")
     moved = []
-    monkeypatch.setattr(mod, "_move_to_front", lambda p, a: moved.append(a.id))
+    monkeypatch.setattr(mod, "_move_to_front", lambda p, a, **k: moved.append(a.id))
     monkeypatch.setattr(mod, "list_accounts", lambda *a, **k: {"accounts": [
         {"label": "fresh@x", "id": "id1", "priority": 0}, {"label": "busy@x", "id": "id0", "priority": 1}]})
     report = mod.auto_rotate()
@@ -715,7 +715,7 @@ def test_duplicate_labels_promote_the_right_entry_id(mod, monkeypatch):
     monkeypatch.setattr(mod, "_usage_for_accounts", lambda accs, p: usage)
     monkeypatch.setattr(mod, "_pool_strategy", lambda p: "fill_first")
     moved = []
-    monkeypatch.setattr(mod, "_move_to_front", lambda p, a: moved.append(a.id))
+    monkeypatch.setattr(mod, "_move_to_front", lambda p, a, **k: moved.append(a.id))
     monkeypatch.setattr(mod, "list_accounts", lambda *a, **k: {"accounts": [
         {"label": "same@x", "id": "idB", "priority": 0}, {"label": "same@x", "id": "idA", "priority": 1}]})
     report = mod.auto_rotate()
@@ -765,6 +765,143 @@ def test_render_keeps_model_family_label_and_unknown_cooldown(mod):
 
 
 # -- desktop half: pure helpers run in node with stubbed SDK imports ----------------
+
+# -- review follow-up 2: fail-closed eligibility, exact entry ids ---------------------
+
+def test_cli_text_rows_are_marked_unverified(mod):
+    _, rows = mod._parse_list(
+        "anthropic (1 credentials):\n#1  a@x  oauth  id=ida  priority=0  hermes_pkce\n")
+    assert rows and all(r.authoritative is False for r in rows)
+    assert _acct(mod, 0, "a@x").authoritative is True
+
+
+def test_switch_require_eligible_declines_cli_text_rows_without_moving(mod, monkeypatch):
+    # The CLI text cannot show dead logins or an exhausted row without a reset.
+    rows = [_acct(mod, 0, "busy@x", authoritative=False), _acct(mod, 1, "fresh@x", authoritative=False)]
+    monkeypatch.setattr(mod, "_read_accounts", lambda p: (p, rows))
+    monkeypatch.setattr(mod, "_pool_strategy", lambda p: "fill_first")
+    monkeypatch.setattr(mod, "_move_to_front", lambda *a, **k: pytest.fail("unverifiable state must not move"))
+    out = mod.switch("id1", require_eligible=True, exact_id=True)
+    assert out["ok"] is False and out["declined"] is True and "unverifiable" in out["reason"]
+    # a manual switch is unchanged
+    moved = []
+    monkeypatch.setattr(mod, "_move_to_front", lambda p, a, **k: moved.append(a.id))
+    monkeypatch.setattr(mod, "list_accounts", lambda *a, **k: {"accounts": []})
+    assert mod.switch("fresh@x")["ok"] is True and moved == ["id1"]
+
+
+def test_auto_declines_when_the_fresh_read_falls_back_to_cli_text(mod, monkeypatch):
+    busy, fresh = _acct(mod, 0, "busy@x"), _acct(mod, 1, "fresh@x")
+    # the direct read failed on the second call; the CLI text shows fresh@x as plain "ok"
+    _seq_reads(monkeypatch, mod, [busy, fresh],
+               [_acct(mod, 0, "busy@x", authoritative=False), _acct(mod, 1, "fresh@x", authoritative=False)])
+    monkeypatch.setattr(mod, "_usage_for_accounts", lambda accs, p: _by_id([busy, fresh], {
+        "busy@x": _usage(week=90), "fresh@x": _usage(week=0)}))
+    monkeypatch.setattr(mod, "_pool_strategy", lambda p: "fill_first")
+    monkeypatch.setattr(mod, "_move_to_front", lambda *a, **k: pytest.fail("must not move"))
+    report = mod.auto_rotate()
+    assert report["ok"] is True and report["promoted"] is None and not report.get("changed")
+    assert report["declined"]["account"] == "fresh@x" and "unverifiable" in report["declined"]["reason"]
+
+
+def test_auto_never_ranks_cli_text_rows(mod, monkeypatch):
+    rows = [_acct(mod, 0, "busy@x", authoritative=False), _acct(mod, 1, "fresh@x", authoritative=False)]
+    monkeypatch.setattr(mod, "_read_accounts", lambda p: (p, rows))
+    monkeypatch.setattr(mod, "_usage_for_accounts", lambda accs, p: _by_id(rows, {
+        "busy@x": _usage(week=90), "fresh@x": _usage(week=0)}))
+    monkeypatch.setattr(mod, "switch", lambda *a, **k: pytest.fail("no candidate, no move"))
+    report = mod.auto_rotate()
+    assert report["alive"] == [] and report["promoted"] is None and report["would_promote"] is None
+    assert report["unknown_reason"] == {"busy@x": "pool_unverified", "fresh@x": "pool_unverified"}
+    assert "not read directly from the pool" in mod.render_auto(report)
+
+
+def test_cooldown_state_is_not_invented_for_unverified_rows(mod):
+    _, rows = mod._parse_list("anthropic (1 credentials):\n#1  a@x  oauth  id=ida  priority=0  hermes_pkce\n")
+    assert rows[0].bench_until is None and rows[0].bench_unknown is False and rows[0].notes == []
+
+
+def _three(mod):
+    return [_acct(mod, 0, "busy@x"), _acct(mod, 1, "fresh@x"), _acct(mod, 2, "other@x")]
+
+
+def test_exact_id_switch_does_not_resolve_labels_numbers_or_prefixes(mod, monkeypatch):
+    accts = _three(mod)
+    monkeypatch.setattr(mod, "_read_accounts", lambda p: (p, accts))
+    monkeypatch.setattr(mod, "_move_to_front", lambda *a, **k: pytest.fail("must not move"))
+    for target in ("fresh@x", "#2", "fre", "FRESH@X", "id", ""):
+        out = mod.switch(target, exact_id=True)
+        assert out["ok"] is False and "exact entry id lookup failed" in out["error"], target
+
+
+def test_exact_id_fails_closed_when_the_entry_disappeared(mod, monkeypatch):
+    accts = [_acct(mod, 0, "busy@x")]
+    monkeypatch.setattr(mod, "_read_accounts", lambda p: (p, accts))
+    monkeypatch.setattr(mod, "_move_to_front", lambda *a, **k: pytest.fail("must not move"))
+    out = mod.switch("id1", require_eligible=True, exact_id=True)
+    assert out["ok"] is False and not out.get("declined") and "may have been removed" in out["error"]
+
+
+def test_exact_id_fails_closed_when_the_id_collides_with_a_label(mod, monkeypatch):
+    victim = mod.Account(index=1, label="id1", auth_type="oauth", id="idZ", priority=0, source="hermes_pkce")
+    target = mod.Account(index=2, label="fresh@x", auth_type="oauth", id="id1", priority=1, source="hermes_pkce")
+    monkeypatch.setattr(mod, "_read_accounts", lambda p: (p, [victim, target]))
+    monkeypatch.setattr(mod, "_move_to_front", lambda *a, **k: pytest.fail("must not move"))
+    out = mod.switch("id1", exact_id=True)
+    assert out["ok"] is False and "collides with another entry's label" in out["error"]
+    # the label-capable manual path is untouched by the flag (still first exact match)
+    assert mod._find([victim, target], "id1").id == "idZ"
+
+
+def test_exact_id_duplicate_ids_fail_closed(mod):
+    a = mod.Account(index=1, label="a", auth_type="oauth", id="dup", priority=0, source="s")
+    b = mod.Account(index=2, label="b", auth_type="oauth", id="dup", priority=1, source="s")
+    assert mod._find_exact_id([a, b], "dup")[0] is None
+
+
+def test_exact_id_move_never_falls_back_to_the_label_resolving_cli(mod, monkeypatch):
+    acct = _acct(mod, 1, "fresh@x")
+    monkeypatch.setattr(mod, "_run", lambda *a, **k: pytest.fail("CLI fallback must not run for exact ids"))
+    monkeypatch.setattr(mod, "_load_pool", lambda p: None)
+    assert "not possible" in mod._move_to_front("anthropic", acct, exact_id=True)
+
+    def boom(_id, _pos):
+        raise RuntimeError("x")
+
+    monkeypatch.setattr(mod, "_load_pool", lambda p: SimpleNamespace(move_entry=boom))
+    assert "not retrying by label" in mod._move_to_front("anthropic", acct, exact_id=True)
+    # non-exact keeps its fallback
+    monkeypatch.setattr(mod, "_run", lambda *a, **k: "Set anthropic credential #1 priority")
+    assert mod._move_to_front("anthropic", acct) is None
+
+
+def test_exact_id_verification_ignores_a_label_only_match(mod, monkeypatch):
+    accts = [_acct(mod, 0, "busy@x"), _acct(mod, 1, "fresh@x")]
+    monkeypatch.setattr(mod, "_read_accounts", lambda p: (p, accts))
+    monkeypatch.setattr(mod, "_pool_strategy", lambda p: "fill_first")
+    monkeypatch.setattr(mod, "_move_to_front", lambda *a, **k: None)
+    # a different entry that merely carries the same label sits at priority 0
+    monkeypatch.setattr(mod, "list_accounts", lambda *a, **k: {"accounts": [
+        {"label": "fresh@x", "id": "idOTHER", "priority": 0}, {"label": "fresh@x", "id": "id1", "priority": 1}]})
+    assert mod.switch("id1", exact_id=True)["verified_first"] is False
+    assert mod.switch("fresh@x")["verified_first"] is True  # manual path keeps its label tolerance
+
+
+def test_auto_uses_the_exact_id_path_and_reports_unverified_moves(mod, monkeypatch):
+    accts = [_acct(mod, 0, "busy@x"), _acct(mod, 1, "fresh@x")]
+    monkeypatch.setattr(mod, "_read_accounts", lambda p: (p, accts))
+    monkeypatch.setattr(mod, "_usage_for_accounts", lambda accs, p: _by_id(accts, {
+        "busy@x": _usage(week=90), "fresh@x": _usage(week=0)}))
+    monkeypatch.setattr(mod, "_pool_strategy", lambda p: "fill_first")
+    seen = {}
+    monkeypatch.setattr(mod, "_move_to_front", lambda p, a, **k: seen.update(id=a.id, kw=k))
+    monkeypatch.setattr(mod, "list_accounts", lambda *a, **k: {"accounts": [
+        {"label": "fresh@x", "id": "idOTHER", "priority": 0}, {"label": "fresh@x", "id": "id1", "priority": 1}]})
+    report = mod.auto_rotate()
+    assert seen == {"id": "id1", "kw": {"exact_id": True}}
+    assert report["ok"] is False and report["promoted"] is None and report["changed"] is True
+    assert "could not be verified by entry id" in report["error"]
+
 
 import json as _json
 import shutil as _shutil

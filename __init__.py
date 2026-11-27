@@ -93,6 +93,10 @@ class Account:
     status: str = "ok"                  # ok | exhausted | dead
     bench_until: Optional[float] = None  # epoch seconds, only while still benched (explicit reset)
     bench_unknown: bool = False          # exhausted, but no stored reset: end of the cooldown unknown
+    # True when read straight from the pool. The CLI-text fallback cannot show dead
+    # logins or an exhausted row without a stored reset, so it sets this to False and
+    # such a row is never treated as proven eligible for an automatic move.
+    authoritative: bool = True
 
     @property
     def safe_label(self) -> str:
@@ -311,6 +315,7 @@ def _parse_list(text: str) -> tuple[str, List[Account]]:
                     current="←" in rest,
                     notes=[f"({bench.group('left').strip()})"] if bench else [],
                     status=STATUS_EXHAUSTED if bench else "ok",
+                    authoritative=False,
                 )
             )
     return provider, accounts
@@ -517,6 +522,26 @@ def _find(accounts: List[Account], target: str) -> Optional[Account]:
     return prefix[0] if len(prefix) == 1 else None
 
 
+def _find_exact_id(accounts: List[Account], entry_id: str) -> Tuple[Optional[Account], Optional[str]]:
+    """Resolve an internal entry id: exact id only, no label, '#n' or prefix matching.
+
+    Fails closed: no match, a duplicated id, or another entry whose *label* equals
+    the id (a label-based lookup could then reach the wrong credential) gives
+    ``(None, reason)``.
+    """
+    eid = str(entry_id or "")
+    if not eid:
+        return None, "no entry id given"
+    hits = [a for a in accounts if a.id == eid]
+    if not hits:
+        return None, f"no pool entry with id {eid} (it may have been removed)"
+    if len(hits) > 1:
+        return None, f"entry id {eid} is not unique in the pool"
+    if any(a.label == eid and a.id != eid for a in accounts):
+        return None, f"entry id {eid} collides with another entry's label"
+    return hits[0], None
+
+
 def _add_hint(provider: str) -> str:
     return f"hermes auth add {provider} --type oauth --label <name>"
 
@@ -682,8 +707,12 @@ def render_setup(status: dict, markdown: bool = False) -> str:
     return "\n".join(lines)
 
 
-def _move_to_front(provider: str, account: Account) -> Optional[str]:
-    """Move *account* to priority 0. Returns an error string or None."""
+def _move_to_front(provider: str, account: Account, *, exact_id: bool = False) -> Optional[str]:
+    """Move *account* to priority 0. Returns an error string or None.
+
+    With ``exact_id`` only the pool's id-keyed ``move_entry`` is used: the CLI
+    fallback resolves its target by index/label/id and could hit another entry.
+    """
     pool = _load_pool(provider)
     if pool is not None and hasattr(pool, "move_entry"):
         try:
@@ -691,7 +720,11 @@ def _move_to_front(provider: str, account: Account) -> Optional[str]:
                 return f"no pool entry with id {account.id}"
             return None
         except Exception as exc:
+            if exact_id:
+                return f"pool.move_entry failed ({type(exc).__name__}); not retrying by label"
             log.warning("pool.move_entry failed (%s); retrying via `hermes auth priority`", exc)
+    if exact_id:
+        return "the pool cannot be accessed directly; an exact-id move is not possible"
     out = _run(["auth", "priority", provider, account.id, "0"])
     if not re.search(r"^Set \S+ credential ", out, re.M):
         return f"hermes auth priority failed: {out[:200]}"
@@ -715,6 +748,7 @@ def switch(
     dry_run: bool = False,
     *,
     require_eligible: bool = False,
+    exact_id: bool = False,
 ) -> dict:
     """Move *target* to priority 0 so the pool tries it first.
 
@@ -722,13 +756,24 @@ def switch(
     A manual switch may still pick a benched login (it only warns). With
     ``require_eligible`` (used by auto rotation) the pool is re-read and a login
     that is dead, benched or of unknown cooldown *now* is declined, not moved:
-    ``{"ok": False, "declined": True, "reason": ...}``.
+    ``{"ok": False, "declined": True, "reason": ...}``. A login whose state was
+    not read straight from the pool (CLI-text fallback) cannot be proven eligible
+    and is declined too.
+
+    With ``exact_id`` (used by auto rotation) *target* is an entry id and nothing
+    else: no label, '#n' or prefix matching, no CLI move fallback, and the
+    post-move check compares ids only. A vanished or ambiguous id fails closed.
     """
     _, accounts = _read_accounts(provider)
     if not accounts:
         return {"ok": False, "error": f"No credentials found for provider '{provider}'. "
                                       f"Add an account: {_add_hint(provider)}"}
-    account = _find(accounts, target)
+    if exact_id:
+        account, why = _find_exact_id(accounts, target)
+        if account is None:
+            return {"ok": False, "error": f"exact entry id lookup failed: {why}"}
+    else:
+        account = _find(accounts, target)
     if account is None:
         return {
             "ok": False,
@@ -736,7 +781,8 @@ def switch(
             "known": [a.safe_label for a in accounts],
         }
     if require_eligible:
-        reason = _ineligible_reason(account, time.time())
+        reason = (_ineligible_reason(account, time.time()) if account.authoritative
+                  else "unverifiable (pool state not read directly; dead or cooldown state unknown)")
         if reason:
             return {"ok": False, "declined": True, "account": account.safe_label, "reason": reason,
                     "error": f"{account.safe_label} is now {reason}; order left unchanged"}
@@ -773,7 +819,7 @@ def switch(
         plan["already_first"] = account.priority == 0
         return plan
 
-    error = _move_to_front(provider, account)
+    error = _move_to_front(provider, account, exact_id=True) if exact_id else _move_to_front(provider, account)
     if error:
         return {"ok": False, "error": error}
     _notify_changed(provider)
@@ -782,7 +828,10 @@ def switch(
     after = list_accounts(provider, with_usage=False)
     active = next((a for a in after["accounts"] if a["priority"] == 0), None)
     plan["order_after"] = [a["label"] for a in after["accounts"]]
-    plan["verified_first"] = bool(active and (active["label"] == account.label or active["id"] == account.id))
+    if exact_id:
+        plan["verified_first"] = bool(active and active["id"] == account.id)
+    else:
+        plan["verified_first"] = bool(active and (active["label"] == account.label or active["id"] == account.id))
     return plan
 
 
@@ -852,6 +901,11 @@ def auto_rotate(provider: str = DEFAULT_PROVIDER, *, dry_run: bool = False) -> d
         if a.status == STATUS_DEAD:
             report["dead"].append(name)
             report["relogin"][name] = _relogin_hint(provider, a.label, a.source)
+        elif not a.authoritative:
+            # CLI-text fallback: dead / unknown-reset state may have been lost, so
+            # eligibility cannot be established. Never a candidate (fail closed).
+            report["unknown"].append(name)
+            report["unknown_reason"][name] = "pool_unverified"
         elif a.bench_unknown:
             report["cooldown_unknown"].append(name)  # exhausted, no stored reset: never promoted
         elif _is_benched(a, now):
@@ -894,8 +948,13 @@ def auto_rotate(provider: str = DEFAULT_PROVIDER, *, dry_run: bool = False) -> d
             # The usage fetch took time and the pool may have changed since the first
             # read: switch() re-reads it and declines a login that is now dead,
             # benched or of unknown cooldown (a manual switch would only warn).
-            plan = switch(best.id, provider, require_eligible=True)
-            if plan.get("ok"):
+            # best.id is an entry id: exact-id path (no label/prefix match, no CLI move).
+            plan = switch(best.id, provider, require_eligible=True, exact_id=True)
+            if plan.get("ok") and plan.get("verified_first") is False:
+                report["changed"] = True  # the move ran, but this entry is not first by id
+                report["ok"] = False
+                report["error"] = "promotion could not be verified by entry id"
+            elif plan.get("ok"):
                 report["promoted"] = name_of[best.id]
                 report["changed"] = True
                 after = list_accounts(provider, with_usage=False)
@@ -1140,6 +1199,9 @@ def render_auto(data: dict, markdown: bool = False) -> str:
         if reasons.get(label) == "scoped_only":
             lines.append(f"? {label} only model-scoped usage seen, no account-level window "
                          "(headroom unproven; left untouched)")
+        elif reasons.get(label) == "pool_unverified":
+            lines.append(f"? {label} state not read directly from the pool (dead / cooldown state "
+                         "unverifiable; left untouched)")
         else:
             lines.append(f"? {label} usage unavailable this round (left untouched)")
     for label, cap in caps.items():
@@ -1166,45 +1228,79 @@ def render_auto(data: dict, markdown: bool = False) -> str:
 
 # -- plugin surfaces ----------------------------------------------------------
 
+@dataclass(frozen=True)
+class _ToolCall:
+    """One ``account_switch`` call, interpreted once for the approval hook and the handler."""
+    action: str
+    target: str
+    provider: str
+    dry_run: bool
+
+    @property
+    def mutating(self) -> bool:
+        """True when this call reorders the pool (and so needs human approval)."""
+        if self.dry_run:
+            return False
+        if self.action == "auto":
+            return True
+        return self.action == "switch" and bool(self.target)
+
+
+def _interpret_tool_args(args: Any) -> _ToolCall:
+    """Single source of truth for what an ``account_switch`` call means.
+
+    The schema does not require ``action``: a missing one means ``switch``, which
+    mutates as soon as a target is given. ``dry_run`` counts only when it is
+    really true (``True`` or a truthy word); any other value, e.g. the string
+    ``"false"``, is not a dry run, so an odd value can never skip approval.
+    """
+    a = args if isinstance(args, dict) else {}
+    action = str(a.get("action") or "switch").strip().lower() or "switch"
+    target = str(a.get("target") or "").strip()
+    provider = str(a.get("provider") or "").strip() or DEFAULT_PROVIDER
+    return _ToolCall(action=action, target=target, provider=provider, dry_run=_truthy(a.get("dry_run")))
+
+
 def _on_pre_tool_call(tool_name: str = "", args: Optional[dict] = None, **_: Any) -> Optional[dict]:
     """Escalate model-initiated real switches to the human-approval gate.
 
     Reordering the credential pool changes which account gets billed first,
-    so a ``switch`` issued by the model must not run silently — a
-    prompt-injected turn could otherwise redirect spend. Read-only calls
-    (``list``, ``plan``, ``dry_run``) pass through untouched. Never raises:
-    a broken gate must not break every other tool.
+    so a ``switch`` or ``auto`` issued by the model must not run silently — a
+    prompt-injected turn could otherwise redirect spend. The call is read with the
+    same :func:`_interpret_tool_args` as the handler, so an omitted action with a
+    target (which the handler treats as ``switch``) is gated too. Read-only calls
+    (``list``, no-target ``switch``, ``plan``, ``dry_run``) pass through untouched.
+    Never raises: a broken gate must not break other tools (for ``account_switch``
+    itself it fails closed and asks for approval).
     """
+    if tool_name != "account_switch":
+        return None
     try:
-        if tool_name != "account_switch" or not isinstance(args, dict):
+        call = _interpret_tool_args(args)
+        if not call.mutating:
             return None
-        if args.get("dry_run"):
-            return None
-        if args.get("action") == "switch":
-            if not str(args.get("target") or "").strip():
-                return None  # switch without target just lists
-            return {
-                "action": "approve",
-                "message": (
-                    "account_switch: move "
-                    f"'{args.get('target')}' to priority 0 of the "
-                    f"{args.get('provider') or DEFAULT_PROVIDER} credential pool "
-                    "(changes which account is tried/billed first)."
-                ),
-            }
-        if args.get("action") == "auto":
+        if call.action == "auto":
             return {
                 "action": "approve",
                 "message": (
                     "account_switch: auto-rotate the "
-                    f"{args.get('provider') or DEFAULT_PROVIDER} credential pool "
+                    f"{call.provider} credential pool "
                     "(promotes the login with the most quota headroom to priority 0 — "
                     "changes which account is tried/billed first)."
                 ),
             }
-        return None
+        return {
+            "action": "approve",
+            "message": (
+                "account_switch: move "
+                f"'{call.target}' to priority 0 of the "
+                f"{call.provider} credential pool "
+                "(changes which account is tried/billed first)."
+            ),
+        }
     except Exception:
-        return None
+        return {"action": "approve",
+                "message": "account_switch: could not classify this call as read-only; approve to run it."}
 
 
 def _tool_account_switch(args: dict, **_: Any) -> str:
@@ -1212,19 +1308,16 @@ def _tool_account_switch(args: dict, **_: Any) -> str:
 
     Hermes dispatches plugin handlers as ``handler(args, **kwargs)`` — the
     whole argument dict arrives positionally, so take the dict and read the
-    fields out of it. Returns a JSON string (the tool result contract).
+    fields out of it. Returns a JSON string (the tool result contract). The call
+    is interpreted by :func:`_interpret_tool_args`, shared with the approval hook.
     """
-    if not isinstance(args, dict):
-        args = {}
-    action = str(args.get("action") or "switch")
-    target = str(args.get("target") or "")
-    provider = str(args.get("provider") or DEFAULT_PROVIDER) or DEFAULT_PROVIDER
-    dry_run = bool(args.get("dry_run", False))
+    call = _interpret_tool_args(args)
+    action, target, provider, dry_run = call.action, call.target, call.provider, call.dry_run
     result: dict
     if action == "list" or (action == "switch" and not target):
         result = list_accounts(provider)
     elif action == "plan":
-        if not target.strip():
+        if not target:
             result = {"ok": False, "error": "plan needs a target (#index, label, id, or unique prefix)."}
         else:
             result = switch(target, provider, dry_run=True)

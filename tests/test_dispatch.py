@@ -153,3 +153,59 @@ def test_gate_escalates_switch_and_auto_but_not_plan_or_list(plugin):
     assert gate(tool_name="account_switch", args={"action": "auto", "dry_run": True}) is None
     out = json.loads(registry.dispatch("account_switch", {"action": "auto", "dry_run": True}))
     assert out["auto"] is True and out["dry_run"] is True
+
+
+# -- approval gate and handler read every call the same way -----------------------------
+
+_GATE_CASES = [
+    # (args, mutates)
+    ({"target": "acct-b"}, True),                                   # omitted action + target = switch
+    ({"action": None, "target": "acct-b"}, True),
+    ({"action": "", "target": "acct-b"}, True),
+    ({"action": " Switch ", "target": "acct-b"}, True),             # case / whitespace
+    ({"action": "switch", "target": "acct-b", "dry_run": "false"}, True),  # not a real dry run
+    ({"action": "switch", "target": "acct-b", "dry_run": 0}, True),
+    ({"action": "auto"}, True),
+    ({"action": "AUTO", "dry_run": "no"}, True),
+    ({"target": "acct-b", "dry_run": True}, False),
+    ({"action": "switch", "target": "acct-b", "dry_run": "true"}, False),
+    ({"action": "auto", "dry_run": True}, False),
+    ({"action": "plan", "target": "acct-b"}, False),
+    ({"action": "list"}, False),
+    ({"action": "list", "target": "acct-b"}, False),
+    ({}, False),                                                    # list
+    ({"action": "switch"}, False),                                  # no target: lists
+    ({"target": "   "}, False),                                     # blank target: lists, never a match-all prefix
+    ({"action": "bogus", "target": "acct-b"}, False),               # rejected by the handler
+]
+
+
+@pytest.mark.parametrize("args,mutates", _GATE_CASES)
+def test_gate_matches_what_the_handler_actually_does(plugin, monkeypatch, args, mutates):
+    mod, ctx = plugin
+    gate = ctx.hooks["pre_tool_call"]
+    ran = []
+    monkeypatch.setattr(mod, "switch", lambda target, provider="anthropic", dry_run=False:
+                        ran.append(("switch", target, dry_run)) or {"ok": True})
+    monkeypatch.setattr(mod, "auto_rotate", lambda provider="anthropic", dry_run=False:
+                        ran.append(("auto", dry_run)) or {"ok": True})
+    verdict = gate(tool_name="account_switch", args=args)
+    registry.dispatch("account_switch", dict(args))
+    really_mutated = any((r[0] == "switch" and not r[2]) or (r[0] == "auto" and not r[1]) for r in ran)
+    assert really_mutated is mutates
+    assert bool(verdict and verdict["action"] == "approve") is mutates
+
+
+def test_gate_omitted_action_message_names_target_and_provider(plugin):
+    _, ctx = plugin
+    v = ctx.hooks["pre_tool_call"](tool_name="account_switch", args={"target": " acct-b ", "provider": "anthropic"})
+    assert v["action"] == "approve" and "'acct-b'" in v["message"] and "anthropic" in v["message"]
+
+
+def test_gate_ignores_other_tools_and_fails_closed_for_account_switch(plugin, monkeypatch):
+    mod, ctx = plugin
+    gate = ctx.hooks["pre_tool_call"]
+    assert gate(tool_name="terminal", args={"target": "x"}) is None
+    monkeypatch.setattr(mod, "_interpret_tool_args", lambda a: (_ for _ in ()).throw(RuntimeError("boom")))
+    assert gate(tool_name="account_switch", args={"action": "list"})["action"] == "approve"
+    assert gate(tool_name="terminal", args={}) is None
