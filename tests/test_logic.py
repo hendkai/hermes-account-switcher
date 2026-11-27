@@ -972,8 +972,11 @@ def _snapshot_env(monkeypatch, mod, rows, *, load_pool=None, reader=None):
         pytest.fail("load_pool() must not be used for a read: it can seed, prune and persist")
 
     _fake_module(monkeypatch, "agent.credential_pool", PooledCredential=Cred, load_pool=load_pool or no_load,
+                 read_credential_pool=reader or (lambda provider: rows),
                  get_pool_strategy=lambda p: "fill_first")
-    _fake_module(monkeypatch, "hermes_cli.auth", read_credential_pool=reader or (lambda provider: rows))
+    # No private-route comeback: hermes_cli.auth has no read accessor here, so any
+    # regression to importing it fails closed (and these tests fail with it).
+    monkeypatch.setitem(sys.modules, "hermes_cli.auth", types.ModuleType("hermes_cli.auth"))
     monkeypatch.setattr(mod, "_run", lambda *a, **k: pytest.fail("no CLI fallback while the snapshot works"))
 
 
@@ -1031,8 +1034,9 @@ def test_unreadable_pool_fails_closed_without_cli_fallback_or_load_pool(mod, mon
 
 
 def test_missing_read_accessor_fails_closed_on_every_read_path(mod, monkeypatch, capsys):
-    """Older core without read_credential_pool: no `hermes auth list` fallback, no load_pool."""
-    monkeypatch.setitem(sys.modules, "hermes_cli.auth", types.ModuleType("hermes_cli.auth"))  # no read accessor
+    """Older core whose public agent.credential_pool lacks the read_credential_pool
+    re-export: no `hermes auth list` fallback, no load_pool, no private import."""
+    monkeypatch.setitem(sys.modules, "hermes_cli.auth", types.ModuleType("hermes_cli.auth"))  # no private route either
     _fake_module(monkeypatch, "agent.credential_pool", PooledCredential=SimpleNamespace,
                  load_pool=lambda p: pytest.fail("load_pool must not be a read fallback"),
                  get_pool_strategy=lambda p: "fill_first")
@@ -1617,12 +1621,20 @@ def test_no_raw_exception_or_subprocess_output_in_diagnostics(mod):
 
 def test_reads_use_only_the_operator_approved_core_read_accessor(mod):
     """Operator decision 2026-11-28: snapshot reads may go through core's
-    read_credential_pool accessor — and through nothing else that touches the auth
-    store. The accessor is called from exactly one place; direct auth-store helpers
-    stay forbidden in the source."""
+    read_credential_pool accessor — via the documented public agent.credential_pool
+    module (on the published plugin API), so catalog rule 9 stays clean — and
+    through nothing else that touches the auth store. The accessor is called from
+    exactly one place; direct auth-store helpers stay forbidden in the source."""
     tree = _ast.parse(PLUGIN_FILE.read_text())
     name = lambda f: f.id if isinstance(f, _ast.Name) else (f.attr if isinstance(f, _ast.Attribute) else "")
     assert _functions_calling(tree, lambda f: name(f) == "read_credential_pool") == {"_load_pool"}
+    # Public route only: the accessor must be imported from agent.credential_pool,
+    # never from the private hermes_cli.auth module (catalog rule 9).
+    imports = [n for n in _ast.walk(tree) if isinstance(n, _ast.ImportFrom)]
+    rcp = [n for n in imports if any(a.name == "read_credential_pool" for a in n.names)]
+    assert rcp, "read_credential_pool must be imported"
+    assert all(n.module == "agent.credential_pool" for n in rcp)
+    assert all(n.module != "hermes_cli.auth" for n in imports), "private core import (catalog rule 9): hermes_cli.auth"
     src = PLUGIN_FILE.read_text()
     for forbidden in ("write_credential_pool", "_load_auth_store", "_auth_store_lock", "_get_json"):
         assert forbidden not in src, forbidden

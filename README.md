@@ -158,15 +158,16 @@ PYTHONPATH=/path/to/hermes-agent pytest tests/
 
 `tests/test_logic.py` is hermetic (fake Hermes modules, no network); `tests/test_dispatch.py` exercises the real tool registry and skips without hermes-agent.
 
-Catalog admission note: the read-only snapshot reads through core's
-`hermes_cli.auth.read_credential_pool` accessor. That name is not (yet) on Hermes'
-published plugin-API allowlist (`agent.credential_pool` and `agent.account_usage`
-are), so `hermes plugins validate` reports it as a *private core import* — a
-warning, not a refusal. Using it is an explicit operator decision (2026-11-28):
-the public alternatives (`load_pool()`, `peek()`, `hermes auth list`) all mutate
-persistent pool state, which the plugin refuses for read paths. The plugin still
-opens no auth store itself, and a source-policy test pins `read_credential_pool`
-to exactly one call site (`_load_pool`).
+Catalog admission note: the read-only snapshot reads through the
+`read_credential_pool` accessor as re-exported by the documented public
+`agent.credential_pool` module (on Hermes' published plugin API), so
+`hermes plugins validate` reports no private core imports. Reading the pool
+this way is an explicit operator decision (2026-11-28): the mutating
+alternatives (`load_pool()`, `peek()`, `hermes auth list`) all persist pool
+state, which the plugin refuses for read paths. The plugin still opens no auth
+store itself, imports nothing from `hermes_cli.auth`, and a source-policy test
+pins `read_credential_pool` to exactly one call site (`_load_pool`) and to the
+public import route.
 
 ## License
 

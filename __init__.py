@@ -53,7 +53,8 @@ How it touches Hermes:
   keeps one small state file (``credential-pool-switcher-state.json`` in the
   Hermes home: timestamps and the last result, no credentials).
 
-The plugin has no auth.json path of its own: pool rows are read through core's
+The plugin has no auth.json path of its own: pool rows are read through the public
+``agent.credential_pool`` module's re-export of core's read-only
 ``read_credential_pool`` accessor, and it never writes auth.json or refreshes tokens.
 Tokens are never printed, logged, returned, or written by this plugin.
 """
@@ -307,7 +308,8 @@ class PoolReadError(RuntimeError):
 class _PoolSnapshot:
     """Read-only view of the persisted pool rows: ``entries()`` only.
 
-    Built from core's ``read_credential_pool`` accessor. It is deliberately NOT a
+    Built from the public ``agent.credential_pool`` re-export of core's read-only
+    ``read_credential_pool`` accessor. It is deliberately NOT a
     ``CredentialPool``: no ``load_pool`` seeding, pruning of dead manual logins,
     exhaustion clearing, priority normalisation or ``_persist`` can happen, and
     there is no ``peek``/``select`` (those run ``_available_entries``, which can
@@ -327,10 +329,15 @@ def _load_pool(provider: str):
     Fails closed: a missing read accessor (older core) or an unreadable pool raises
     :class:`PoolReadError`. Nothing is retried through ``load_pool``, ``peek`` or
     ``hermes auth list``: those can seed or prune entries, clear exhaustion and persist.
+    The accessor is imported from the documented public ``agent.credential_pool``
+    module; importing it from ``hermes_cli.auth`` directly is a private core import
+    (catalog rule 9).
     """
     try:
-        from agent.credential_pool import PooledCredential  # type: ignore
-        from hermes_cli.auth import read_credential_pool  # type: ignore
+        # Public route (operator-approved 2026-11-28): agent.credential_pool is on
+        # Hermes' published plugin API and re-exports the read-only accessor; pulling
+        # it from hermes_cli.auth directly would be a private core import (rule 9).
+        from agent.credential_pool import PooledCredential, read_credential_pool  # type: ignore
     except Exception as exc:
         log.warning("read-only pool accessors not importable: %s", type(exc).__name__)
         raise PoolReadError(
