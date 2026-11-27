@@ -11,12 +11,17 @@ Surfaces:
 
 How it touches Hermes:
 
-* **Listing / switching** read the pool through ``agent.credential_pool``
-  (``load_pool`` -> ``entries()`` / ``peek()`` / ``move_entry()``) — the same
-  calls ``hermes auth list`` / ``hermes auth priority`` make. When that
-  module is not importable it falls back to running those two CLI commands
-  and parsing their output. Switching = "move to priority 0", i.e. that
-  account is tried first on the next model call (``fill_first`` strategy).
+* **Reading** (list, status, usage, auto ranking) uses a non-mutating snapshot:
+  core's ``read_credential_pool`` rows wrapped in ``PooledCredential`` objects.
+  ``load_pool()`` and ``peek()`` are NOT used for reads: they can seed or prune
+  entries, clear exhaustion and persist. Rows borrowed from another tool (e.g.
+  Claude Code) carry no token in that snapshot, so they show no usage and are never
+  promoted by auto. When the read accessor is missing (older core) a display-only
+  fallback parses ``hermes auth list``; such rows are non-authoritative.
+* **Switching** = "move to priority 0" through ``load_pool().move_entry()`` (the call
+  behind ``hermes auth priority``): the only place the real pool is loaded. Auto
+  rotation re-validates the exact id on that same pool object right before the move.
+  The account is tried first on the next model call (``fill_first`` strategy).
 * **Usage percentages** (list only) go through Hermes' public
   ``fetch_account_usage(read_only=True, identity_id=<entry id>)``: each usable
   pooled OAuth token is sent to the provider's own API (api.anthropic.com) by
@@ -323,16 +328,66 @@ def _parse_list(text: str) -> tuple[str, List[Account]]:
 
 # -- direct pool access ------------------------------------------------------------
 
+class PoolReadError(RuntimeError):
+    """The pool is reachable but could not be read safely; callers fail closed."""
+
+
+class _PoolSnapshot:
+    """Read-only view of the persisted pool rows: ``entries()`` only.
+
+    Built from core's ``read_credential_pool`` accessor. It is deliberately NOT a
+    ``CredentialPool``: no ``load_pool`` seeding, pruning of dead manual logins,
+    exhaustion clearing, priority normalisation or ``_persist`` can happen, and
+    there is no ``peek``/``select`` (those run ``_available_entries``, which can
+    clear cooldowns and prune entries and then persist).
+    """
+
+    def __init__(self, entries) -> None:
+        self._entries = list(entries)
+
+    def entries(self) -> list:
+        return list(self._entries)
+
+
 def _load_pool(provider: str):
+    """Non-mutating snapshot of the pool, or None when core has no read accessor.
+
+    None means "use the CLI-text fallback" (older core). A pool that exists but
+    cannot be read raises :class:`PoolReadError`: nothing is retried through a
+    helper that could write.
+    """
+    try:
+        from agent.credential_pool import PooledCredential  # type: ignore
+        from hermes_cli.auth import read_credential_pool  # type: ignore
+    except Exception as exc:
+        log.debug("read-only pool accessors not importable (%s); using the CLI fallback", exc)
+        return None
+    try:
+        rows = read_credential_pool(provider)
+        entries = [PooledCredential.from_dict(provider, row) for row in rows if isinstance(row, dict)]
+        entries.sort(key=lambda e: int(getattr(e, "priority", 0) or 0))
+    except Exception as exc:
+        log.warning("reading the %s pool snapshot failed: %s", provider, type(exc).__name__)
+        raise PoolReadError(f"could not read the {provider} credential pool ({type(exc).__name__})") from exc
+    return _PoolSnapshot(entries)
+
+
+def _load_writable_pool(provider: str):
+    """The real ``CredentialPool`` — used ONLY by :func:`_move_to_front`.
+
+    ``load_pool`` may normalise priorities, seed or prune entries and persist
+    them: acceptable for a move (which persists anyway, like ``hermes auth
+    priority``), never for a read path.
+    """
     try:
         from agent.credential_pool import load_pool  # type: ignore
     except Exception as exc:
-        log.debug("agent.credential_pool not importable (%s); using the CLI fallback", exc)
+        log.debug("agent.credential_pool not importable (%s)", exc)
         return None
     try:
         return load_pool(provider)
     except Exception as exc:
-        log.warning("load_pool(%s) failed: %s", provider, exc)
+        log.warning("load_pool(%s) failed: %s", provider, type(exc).__name__)
         return None
 
 
@@ -354,11 +409,11 @@ def _bench_until(entry) -> Optional[float]:
 
 
 def _accounts_from_pool(pool) -> List[Account]:
-    try:
-        current = pool.peek()
-    except Exception as exc:
-        log.debug("pool.peek() failed: %s", exc)
-        current = None
+    """Rows from ``pool.entries()`` only (never ``peek``: it can write).
+
+    ``current`` is derived: the first row, in priority order, that is neither dead
+    nor benched: what ``peek`` would return on a freshly loaded pool.
+    """
     now = time.time()
     out: List[Account] = []
     for idx, e in enumerate(pool.entries(), start=1):
@@ -383,23 +438,27 @@ def _accounts_from_pool(pool) -> List[Account]:
             id=str(e.id),
             priority=int(getattr(e, "priority", idx - 1)),
             source=_display_source(str(getattr(e, "source", "") or "")),
-            current=bool(current is not None and current.id == e.id),
             notes=notes,
             status=status if status in (STATUS_EXHAUSTED, STATUS_DEAD) else "ok",
             bench_until=until,
             bench_unknown=unknown,
         ))
+    first_usable = next((a for a in out if a.status != STATUS_DEAD and not _is_benched(a, now)), None)
+    if first_usable is not None:
+        first_usable.current = True
     return out
 
 
 def _read_accounts(provider: str) -> Tuple[str, List[Account]]:
     """Pool rows in priority order: direct pool access, CLI parsing as fallback."""
-    pool = _load_pool(provider)
+    pool = _load_pool(provider)  # raises PoolReadError when the pool exists but is unreadable
     if pool is not None:
         try:
             return provider, _accounts_from_pool(pool)
         except Exception as exc:
-            log.warning("reading pool %s directly failed (%s); using the CLI fallback", provider, exc)
+            raise PoolReadError(f"could not interpret the {provider} credential pool ({type(exc).__name__})") from exc
+    # Old core without the read accessor: display-only text fallback (rows are
+    # marked non-authoritative; nothing automatic ever acts on them).
     return _parse_list(_run(["auth", "list", provider]))
 
 
@@ -437,7 +496,10 @@ def _usage_for_accounts(accounts: List[Account], provider: str = DEFAULT_PROVIDE
     except Exception as exc:
         log.debug("agent.account_usage not importable: %s", exc)
         return None
-    pool = _load_pool(provider)
+    try:
+        pool = _load_pool(provider)
+    except PoolReadError:
+        return None
     if pool is None:
         return None
     with_identity = _fetch_supports_identity(fetch_account_usage)
@@ -707,24 +769,49 @@ def render_setup(status: dict, markdown: bool = False) -> str:
     return "\n".join(lines)
 
 
-def _move_to_front(provider: str, account: Account, *, exact_id: bool = False) -> Optional[str]:
-    """Move *account* to priority 0. Returns an error string or None.
+class _MoveDeclined(str):
+    """Returned by :func:`_move_to_front` when the pool state used for the move no
+    longer allows it: a decline (nothing moved), not an error. The text is the reason."""
 
-    With ``exact_id`` only the pool's id-keyed ``move_entry`` is used: the CLI
-    fallback resolves its target by index/label/id and could hit another entry.
+
+def _move_to_front(provider: str, account: Account, *, exact_id: bool = False,
+                   require_eligible: bool = False) -> Optional[str]:
+    """Move *account* to priority 0. Returns an error string, a :class:`_MoveDeclined`, or None.
+
+    With ``exact_id`` / ``require_eligible`` (auto rotation) only the pool's id-keyed
+    ``move_entry`` is used (the CLI fallback resolves by index/label/id and could hit
+    another entry), and the very pool object that ``move_entry`` then runs on is
+    re-checked first: the id must still be unique, must not collide with a label,
+    and (``require_eligible``) must still be alive, not benched and not of unknown
+    cooldown. Otherwise nothing is moved.
     """
-    pool = _load_pool(provider)
+    strict = exact_id or require_eligible
+    pool = _load_writable_pool(provider)
     if pool is not None and hasattr(pool, "move_entry"):
+        if strict:
+            try:
+                fresh, why = _find_exact_id(_accounts_from_pool(pool), account.id)
+            except Exception as exc:
+                return f"could not re-read the pool state for the move ({type(exc).__name__}); order left unchanged"
+            if fresh is None:
+                return f"exact entry id lookup failed: {why}"
+            if require_eligible:
+                reason = _ineligible_reason(fresh, time.time())
+                if reason:
+                    return _MoveDeclined(reason)
+                blocker = _switch_blocker(fresh, provider)
+                if blocker:
+                    return blocker
         try:
             if pool.move_entry(account.id, 0) is None:
                 return f"no pool entry with id {account.id}"
             return None
         except Exception as exc:
-            if exact_id:
+            if strict:
                 return f"pool.move_entry failed ({type(exc).__name__}); not retrying by label"
             log.warning("pool.move_entry failed (%s); retrying via `hermes auth priority`", exc)
-    if exact_id:
-        return "the pool cannot be accessed directly; an exact-id move is not possible"
+    if strict:
+        return "the pool cannot be accessed directly; an exact-id, re-validated move is not possible"
     out = _run(["auth", "priority", provider, account.id, "0"])
     if not re.search(r"^Set \S+ credential ", out, re.M):
         return f"hermes auth priority failed: {out[:200]}"
@@ -760,9 +847,11 @@ def switch(
     not read straight from the pool (CLI-text fallback) cannot be proven eligible
     and is declined too.
 
-    With ``exact_id`` (used by auto rotation) *target* is an entry id and nothing
-    else: no label, '#n' or prefix matching, no CLI move fallback, and the
+    With ``exact_id`` (auto rotation and desktop row clicks) *target* is an entry id
+    and nothing else: no label, '#n' or prefix matching, no CLI move fallback, and the
     post-move check compares ids only. A vanished or ambiguous id fails closed.
+    With ``require_eligible`` the pool object used for the move itself is re-validated
+    (see :func:`_move_to_front`), so a state change after the first read declines.
     """
     _, accounts = _read_accounts(provider)
     if not accounts:
@@ -819,13 +908,23 @@ def switch(
         plan["already_first"] = account.priority == 0
         return plan
 
-    error = _move_to_front(provider, account, exact_id=True) if exact_id else _move_to_front(provider, account)
+    flags = {k: True for k, v in (("exact_id", exact_id), ("require_eligible", require_eligible)) if v}
+    error = _move_to_front(provider, account, **flags)
+    if isinstance(error, _MoveDeclined):
+        # The pool state that the move would have used is no longer eligible.
+        return {"ok": False, "declined": True, "account": account.safe_label, "reason": str(error),
+                "error": f"{account.safe_label} is now {error}; order left unchanged"}
     if error:
         return {"ok": False, "error": error}
     _notify_changed(provider)
 
     # Verification only needs the order — no usage fetch (the usage endpoint 429s).
-    after = list_accounts(provider, with_usage=False)
+    try:
+        after = list_accounts(provider, with_usage=False)
+    except PoolReadError:
+        plan["order_after"] = []
+        plan["verified_first"] = False
+        return plan
     active = next((a for a in after["accounts"] if a["priority"] == 0), None)
     plan["order_after"] = [a["label"] for a in after["accounts"]]
     if exact_id:
@@ -957,8 +1056,11 @@ def auto_rotate(provider: str = DEFAULT_PROVIDER, *, dry_run: bool = False) -> d
             elif plan.get("ok"):
                 report["promoted"] = name_of[best.id]
                 report["changed"] = True
-                after = list_accounts(provider, with_usage=False)
-                report["order_after"] = [a["label"] for a in after["accounts"]]
+                try:
+                    after = list_accounts(provider, with_usage=False)
+                    report["order_after"] = [a["label"] for a in after["accounts"]]
+                except PoolReadError:
+                    report["order_after"] = None
             elif plan.get("declined"):
                 report["declined"] = {"account": name_of[best.id], "reason": plan.get("reason")}
             else:
@@ -1312,6 +1414,13 @@ def _tool_account_switch(args: dict, **_: Any) -> str:
     is interpreted by :func:`_interpret_tool_args`, shared with the approval hook.
     """
     call = _interpret_tool_args(args)
+    try:
+        return json.dumps(_dispatch_tool_call(call), default=str)
+    except PoolReadError as exc:
+        return json.dumps({"ok": False, "error": f"{exc}; nothing was changed"})
+
+
+def _dispatch_tool_call(call: _ToolCall) -> dict:
     action, target, provider, dry_run = call.action, call.target, call.provider, call.dry_run
     result: dict
     if action == "list" or (action == "switch" and not target):
@@ -1327,7 +1436,7 @@ def _tool_account_switch(args: dict, **_: Any) -> str:
         result = auto_rotate(provider, dry_run=dry_run)
     else:
         result = {"ok": False, "error": f"Unknown action '{action}'. Use list, switch, plan, or auto."}
-    return json.dumps(result, default=str)
+    return result
 
 
 def _setup_argparse(p) -> None:
@@ -1338,9 +1447,12 @@ def _setup_argparse(p) -> None:
     sw.add_argument("target", help="#index, exact label, entry id, or unique label prefix")
     sw.add_argument("--provider", default=DEFAULT_PROVIDER)
     sw.add_argument("--dry-run", action="store_true")
+    sw.add_argument("--exact-id", action="store_true",
+                    help="treat target as an entry id only (no label / #n / prefix matching); used by the desktop rows")
     pl = sub.add_parser("plan", help="show what a switch would do")
     pl.add_argument("target")
     pl.add_argument("--provider", default=DEFAULT_PROVIDER)
+    pl.add_argument("--exact-id", action="store_true", help="treat target as an entry id only")
     st = sub.add_parser("status", help="pool snapshot for status indicators (no network unless --usage)")
     st.add_argument("--provider", default=DEFAULT_PROVIDER)
     st.add_argument("--json", action="store_true", help=f"one '{STATUS_LINE_PREFIX.strip()} <json>' line")
@@ -1358,13 +1470,23 @@ def _arg(args, name: str, default):
 
 
 def _handle_cli(args) -> None:
+    try:
+        _handle_cli_cmd(args)
+    except PoolReadError as exc:
+        print(f"Credential pool not read: {exc}; nothing was changed")
+
+
+def _handle_cli_cmd(args) -> None:
     cmd = _arg(args, "cmd", "list")
     if cmd == "list":
         print(render_list(list_accounts(_arg(args, "provider", DEFAULT_PROVIDER))))
     elif cmd == "plan":
-        print(render_switch(switch(args.target, _arg(args, "provider", DEFAULT_PROVIDER), dry_run=True)))
+        print(render_switch(switch(args.target, _arg(args, "provider", DEFAULT_PROVIDER), dry_run=True,
+                                   exact_id=bool(_arg(args, "exact_id", False)))))
     elif cmd == "switch":
-        print(render_switch(switch(args.target, _arg(args, "provider", DEFAULT_PROVIDER), dry_run=_arg(args, "dry_run", False))))
+        print(render_switch(switch(args.target, _arg(args, "provider", DEFAULT_PROVIDER),
+                                   dry_run=_arg(args, "dry_run", False),
+                                   exact_id=bool(_arg(args, "exact_id", False)))))
     elif cmd == "auto":
         print(render_auto(auto_rotate(_arg(args, "provider", DEFAULT_PROVIDER),
                                       dry_run=_arg(args, "dry_run", False))))
@@ -1389,6 +1511,13 @@ _SLASH_USAGE = (
 
 
 def _slash(arg: str = "", **_: Any) -> str:
+    try:
+        return _slash_impl(arg)
+    except PoolReadError as exc:
+        return f"Credential pool not read: {exc}; nothing was changed"
+
+
+def _slash_impl(arg: str = "") -> str:
     parts = (arg or "").strip().split()
     provider = DEFAULT_PROVIDER
     rest: List[str] = []

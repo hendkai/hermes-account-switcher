@@ -282,7 +282,9 @@ function Panel({ status, t }) {
     }
   }
 
-  const onSwitch = (row) => act(['switch', row.id || row.label], t('switched', row.label), (m) => t('switchFailed', m))
+  // A row click carries the credential's entry id: pass it as an exact id (no label / #n / prefix
+  // matching), so a row whose label happens to equal another row's id cannot be switched instead.
+  const onSwitch = (row) => act(row.id ? ['switch', '--exact-id', row.id] : ['switch', row.label], t('switched', row.label), (m) => t('switchFailed', m))
   const dead = status.accounts.filter((r) => r.status === 'dead')
 
   return jsxs('div', {

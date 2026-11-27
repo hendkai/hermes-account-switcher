@@ -91,7 +91,7 @@ def test_accounts_from_pool_marks_dead_and_benched(mod):
 
     entries = [entry(0, "ok@x"), entry(1, "dead@x", "dead"), entry(2, "bench@x", "exhausted", _iso(now + 3700)),
                entry(3, "expired@x", "exhausted", _iso(now - 60))]
-    pool = SimpleNamespace(entries=lambda: entries, peek=lambda: entries[0])
+    pool = SimpleNamespace(entries=lambda: entries)  # no peek(): reads never call it
     accounts = mod._accounts_from_pool(pool)
     by = {a.label: a for a in accounts}
     assert by["ok@x"].current and by["ok@x"].status == "ok"
@@ -109,7 +109,7 @@ def test_exhausted_row_without_reset_has_unknown_cooldown_not_a_fabricated_hour(
         last_error_reset_at=None, failure_reason=None,
     )
     old = SimpleNamespace(**{**e.__dict__, "id": "id8", "label": "old@x", "last_status_at": now - 7200})
-    pool = SimpleNamespace(entries=lambda: [e, old], peek=lambda: None)
+    pool = SimpleNamespace(entries=lambda: [e, old])
     by = {a.label: a for a in mod._accounts_from_pool(pool)}
     for a in by.values():
         assert a.bench_until is None and a.bench_unknown is True
@@ -171,7 +171,7 @@ def test_switch_verifies_without_usage_and_warns(mod, monkeypatch):
 
 
 def test_move_to_front_cli_fallback_checks_success_line(mod, monkeypatch):
-    monkeypatch.setattr(mod, "_load_pool", lambda p: None)
+    monkeypatch.setattr(mod, "_load_writable_pool", lambda p: None)
     acct = _acct(mod, 1, "b@x")
     monkeypatch.setattr(mod, "_run", lambda args: 'Set anthropic credential "b@x" to priority 0 (#1 in ...)')
     assert mod._move_to_front("anthropic", acct) is None
@@ -208,7 +208,7 @@ def test_usage_uses_public_helper_and_skips_dead(mod, monkeypatch):
 
 def test_catalog_build_has_no_auth_store_or_refresh_paths(mod):
     src = PLUGIN_FILE.read_text()
-    for forbidden in ("write_credential_pool", "read_credential_pool", "_auth_store_lock",
+    for forbidden in ("write_credential_pool", "_load_auth_store", "_auth_store_lock",
                       "_refresh_entry", "_get_json", "oauth/usage", "_write_auto_status"):
         assert forbidden not in src, forbidden
 
@@ -219,7 +219,7 @@ def test_catalog_build_sends_no_message_probe_and_writes_no_cooldown(mod):
     for forbidden in ("v1/messages", "urllib", "requests.", "httpx", "http.client", "aiohttp",
                       "mark_exhausted", "mark_used", "_mark_", "last_error_reset_at =",
                       "last_status =", "last_status_at =", "auth.json\"", "auth_store",
-                      "_exhausted_until", "_exhausted_ttl", "_available_entries",
+                      "_exhausted_until", "_exhausted_ttl",
                       "refresh_token", "_EXHAUSTED_FALLBACK_SECONDS"):
         assert forbidden not in src, forbidden
 
@@ -859,16 +859,24 @@ def test_exact_id_duplicate_ids_fail_closed(mod):
     assert mod._find_exact_id([a, b], "dup")[0] is None
 
 
+def _pool_entry(i, label, *, status=None, reset=None, token="", eid=None, source="manual:hermes_pkce"):
+    return SimpleNamespace(
+        id=eid or f"id{i}", label=label, auth_type="oauth", priority=i, source=source,
+        last_status=status, last_status_at=time.time() if status else None, last_error_code=None,
+        last_error_reset_at=reset, failure_reason=None, access_token=token)
+
+
 def test_exact_id_move_never_falls_back_to_the_label_resolving_cli(mod, monkeypatch):
     acct = _acct(mod, 1, "fresh@x")
     monkeypatch.setattr(mod, "_run", lambda *a, **k: pytest.fail("CLI fallback must not run for exact ids"))
-    monkeypatch.setattr(mod, "_load_pool", lambda p: None)
+    monkeypatch.setattr(mod, "_load_writable_pool", lambda p: None)
     assert "not possible" in mod._move_to_front("anthropic", acct, exact_id=True)
 
     def boom(_id, _pos):
         raise RuntimeError("x")
 
-    monkeypatch.setattr(mod, "_load_pool", lambda p: SimpleNamespace(move_entry=boom))
+    entries = [_pool_entry(0, "busy@x"), _pool_entry(1, "fresh@x")]
+    monkeypatch.setattr(mod, "_load_writable_pool", lambda p: SimpleNamespace(move_entry=boom, entries=lambda: entries))
     assert "not retrying by label" in mod._move_to_front("anthropic", acct, exact_id=True)
     # non-exact keeps its fallback
     monkeypatch.setattr(mod, "_run", lambda *a, **k: "Set anthropic credential #1 priority")
@@ -898,7 +906,7 @@ def test_auto_uses_the_exact_id_path_and_reports_unverified_moves(mod, monkeypat
     monkeypatch.setattr(mod, "list_accounts", lambda *a, **k: {"accounts": [
         {"label": "fresh@x", "id": "idOTHER", "priority": 0}, {"label": "fresh@x", "id": "id1", "priority": 1}]})
     report = mod.auto_rotate()
-    assert seen == {"id": "id1", "kw": {"exact_id": True}}
+    assert seen == {"id": "id1", "kw": {"exact_id": True, "require_eligible": True}}
     assert report["ok"] is False and report["promoted"] is None and report["changed"] is True
     assert "could not be verified by entry id" in report["error"]
 
@@ -946,3 +954,235 @@ console.log(JSON.stringify(out))
     assert "Opus week" in out["bars"] and "model" not in out["bars"].replace("Opus week", "")
     assert "model" in out["fallback"]  # generic label only when the backend sent none
     assert "Cooldown" in out["de"]
+
+
+# -- Astra round 3: read-only snapshot, same-pool revalidation, desktop exact ids -----------
+
+import ast as _ast
+import json
+import argparse as _argparse
+
+
+def _snapshot_env(monkeypatch, mod, rows, *, load_pool=None, reader=None):
+    """Fake core: read_credential_pool returns *rows*; load_pool must never run for reads."""
+    class Cred(SimpleNamespace):
+        @classmethod
+        def from_dict(cls, provider, row):
+            return cls(**{"label": row.get("id"), "auth_type": "oauth", "priority": 0, "source": "manual:x",
+                          "last_status": None, "last_error_reset_at": None, "access_token": "", **row})
+
+    def no_load(provider):
+        pytest.fail("load_pool() must not be used for a read: it can seed, prune and persist")
+
+    _fake_module(monkeypatch, "agent.credential_pool", PooledCredential=Cred, load_pool=load_pool or no_load,
+                 get_pool_strategy=lambda p: "fill_first")
+    _fake_module(monkeypatch, "hermes_cli.auth", read_credential_pool=reader or (lambda provider: rows))
+    monkeypatch.setattr(mod, "_run", lambda *a, **k: pytest.fail("no CLI fallback while the snapshot works"))
+
+
+def test_reads_use_the_snapshot_never_load_pool_or_peek(mod, monkeypatch):
+    now = time.time()
+    rows = [
+        {"id": "idB", "label": "b@x", "priority": 1, "access_token": "tok-b"},
+        {"id": "idD", "label": "dead@x", "priority": 0, "last_status": "dead"},
+        {"id": "idA", "label": "a@x", "priority": 2, "access_token": "tok-a",
+         "last_status": "exhausted", "last_error_reset_at": _iso(now + 600)},
+    ]
+    _snapshot_env(monkeypatch, mod, rows)
+    calls = []
+    _fake_module(monkeypatch, "agent.account_usage",
+                 fetch_account_usage=lambda provider, api_key=None, read_only=False, identity_id=None: (
+                     calls.append((api_key, identity_id)) or SimpleNamespace(windows=[
+                         SimpleNamespace(label="Current week", used_percent=10.0, scope="account")])))
+    data = mod.list_accounts()
+    assert [a["id"] for a in data["accounts"]] == ["idD", "idB", "idA"]  # priority order
+    by = {a["id"]: a for a in data["accounts"]}
+    assert by["idB"]["current"] is True and by["idD"]["current"] is False and by["idA"]["current"] is False
+    assert by["idD"]["needs_login"] and by["idA"]["benched"]
+    assert sorted(calls) == [("tok-a", "idA"), ("tok-b", "idB")]  # tokens come from the snapshot rows
+    status = mod.pool_status()
+    assert status["active"]["id"] == "idB"
+
+
+def test_borrowed_row_without_token_gets_no_usage_and_is_never_promoted(mod, monkeypatch):
+    rows = [{"id": "idA", "label": "a@x", "priority": 0, "access_token": "tok-a"},
+            {"id": "idC", "label": "cc@x", "priority": 1, "source": "claude_code"}]  # secrets stripped on disk
+    _snapshot_env(monkeypatch, mod, rows)
+    _fake_module(monkeypatch, "agent.account_usage",
+                 fetch_account_usage=lambda provider, api_key=None, read_only=False, identity_id=None: SimpleNamespace(
+                     windows=[SimpleNamespace(label="Current week", used_percent=5.0, scope="account")]))
+    _, accounts = mod._read_accounts("anthropic")
+    assert set(mod._usage_for_accounts(accounts)) == {"idA"}
+    report = mod.auto_rotate(dry_run=True)
+    assert report["unknown_reason"]["cc@x"] == "no_usage" and "cc@x" not in report["alive"]
+
+
+def test_unreadable_pool_fails_closed_without_cli_fallback_or_load_pool(mod, monkeypatch):
+    def boom(provider):
+        raise OSError("EIO")
+
+    _snapshot_env(monkeypatch, mod, [], reader=boom)
+    with pytest.raises(mod.PoolReadError):
+        mod.list_accounts()
+    out = json.loads(mod._tool_account_switch({"action": "list"}))
+    assert out["ok"] is False and "nothing was changed" in out["error"]
+    assert "not read" in mod._slash("list") and "nothing was changed" in mod._slash("list")
+    moved = []
+    monkeypatch.setattr(mod, "_load_writable_pool", lambda p: moved.append(p))
+    assert json.loads(mod._tool_account_switch({"action": "switch", "target": "a"}))["ok"] is False
+    assert moved == []  # no write path was even opened
+
+
+def test_missing_read_accessor_falls_back_to_display_only_text(mod, monkeypatch):
+    monkeypatch.setitem(sys.modules, "hermes_cli.auth", types.ModuleType("hermes_cli.auth"))  # no read accessor
+    monkeypatch.setattr(mod, "_run", lambda args: "anthropic (1 credentials):\n  #1  a@x oauth id=idA priority=0 hermes_pkce ←")
+    _, accounts = mod._read_accounts("anthropic")
+    assert accounts[0].authoritative is False
+
+
+def _functions_calling(tree, predicate):
+    hits = {}
+    for fn in [n for n in _ast.walk(tree) if isinstance(n, (_ast.FunctionDef, _ast.AsyncFunctionDef))]:
+        for node in _ast.walk(fn):
+            if isinstance(node, _ast.Call) and predicate(node.func):
+                hits.setdefault(fn.name, 0)
+                hits[fn.name] += 1
+    return set(hits)
+
+
+def test_source_calls_load_pool_and_peek_only_where_a_write_is_allowed(mod):
+    tree = _ast.parse(PLUGIN_FILE.read_text())
+    name = lambda f: f.id if isinstance(f, _ast.Name) else (f.attr if isinstance(f, _ast.Attribute) else "")
+    assert _functions_calling(tree, lambda f: name(f) == "load_pool") == {"_load_writable_pool"}
+    assert _functions_calling(tree, lambda f: name(f) in {"peek", "choose", "reclaim", "has_available",
+                                                         "lift_reopened_cooldowns", "next_available_at"}) == set()
+    assert _functions_calling(tree, lambda f: name(f) == "_load_writable_pool") == {"_move_to_front"}
+    assert _functions_calling(tree, lambda f: name(f) == "move_entry") == {"_move_to_front"}
+
+
+# -- same-pool revalidation of the exact id right before the move ---------------------------
+
+def _writable(entries, moved):
+    return SimpleNamespace(entries=lambda: entries, move_entry=lambda i, pos: moved.append((i, pos)) or object())
+
+
+def test_move_declines_when_the_move_pool_shows_the_winner_exhausted_without_reset(mod, monkeypatch):
+    moved = []
+    entries = [_pool_entry(0, "busy@x"), _pool_entry(1, "fresh@x", status="exhausted")]
+    monkeypatch.setattr(mod, "_load_writable_pool", lambda p: _writable(entries, moved))
+    out = mod._move_to_front("anthropic", _acct(mod, 1, "fresh@x"), exact_id=True, require_eligible=True)
+    assert isinstance(out, mod._MoveDeclined) and "unknown cooldown" in out and moved == []
+
+
+@pytest.mark.parametrize("status,reset", [("dead", None), ("exhausted", "FUTURE")])
+def test_move_declines_dead_or_benched_winner_on_the_move_pool(mod, monkeypatch, status, reset):
+    moved = []
+    reset = _iso(time.time() + 900) if reset else None
+    entries = [_pool_entry(0, "busy@x"), _pool_entry(1, "fresh@x", status=status, reset=reset)]
+    monkeypatch.setattr(mod, "_load_writable_pool", lambda p: _writable(entries, moved))
+    out = mod._move_to_front("anthropic", _acct(mod, 1, "fresh@x"), exact_id=True, require_eligible=True)
+    assert isinstance(out, mod._MoveDeclined) and moved == []
+
+
+def test_move_fails_closed_when_the_id_vanished_or_collides_with_a_label_on_the_move_pool(mod, monkeypatch):
+    moved = []
+    gone = [_pool_entry(0, "busy@x")]
+    monkeypatch.setattr(mod, "_load_writable_pool", lambda p: _writable(gone, moved))
+    out = mod._move_to_front("anthropic", _acct(mod, 1, "fresh@x"), exact_id=True, require_eligible=True)
+    assert out and not isinstance(out, mod._MoveDeclined) and "no pool entry" in out
+    clash = [_pool_entry(0, "id1"), _pool_entry(1, "fresh@x")]  # entry 0's LABEL equals entry 1's id
+    monkeypatch.setattr(mod, "_load_writable_pool", lambda p: _writable(clash, moved))
+    out = mod._move_to_front("anthropic", _acct(mod, 1, "fresh@x"), exact_id=True, require_eligible=True)
+    assert "collides" in out and moved == []
+    dup = [_pool_entry(0, "a", eid="id1"), _pool_entry(1, "fresh@x")]
+    monkeypatch.setattr(mod, "_load_writable_pool", lambda p: _writable(dup, moved))
+    assert "not unique" in mod._move_to_front("anthropic", _acct(mod, 1, "fresh@x"), exact_id=True, require_eligible=True)
+    assert moved == []
+
+
+def test_move_runs_on_the_same_pool_object_it_validated(mod, monkeypatch):
+    moved = []
+    entries = [_pool_entry(0, "busy@x"), _pool_entry(1, "fresh@x")]
+    loads = []
+    monkeypatch.setattr(mod, "_load_writable_pool", lambda p: loads.append(p) or _writable(entries, moved))
+    assert mod._move_to_front("anthropic", _acct(mod, 1, "fresh@x"), exact_id=True, require_eligible=True) is None
+    assert moved == [("id1", 0)] and loads == ["anthropic"]  # one load serves check and move
+
+
+def test_state_change_between_precheck_and_move_reload_declines_end_to_end(mod, monkeypatch):
+    """First read: winner eligible. The reload used for the move: winner got benched/dead meanwhile."""
+    accts = [_acct(mod, 0, "busy@x"), _acct(mod, 1, "fresh@x")]
+    monkeypatch.setattr(mod, "_read_accounts", lambda p: (p, accts))  # precheck snapshot: all fine
+    monkeypatch.setattr(mod, "_usage_for_accounts", lambda accs, p: _by_id(accts, {
+        "busy@x": _usage(week=90), "fresh@x": _usage(week=0)}))
+    monkeypatch.setattr(mod, "_pool_strategy", lambda p: "fill_first")
+    moved = []
+    changed = [_pool_entry(0, "busy@x"), _pool_entry(1, "fresh@x", status="dead")]
+    monkeypatch.setattr(mod, "_load_writable_pool", lambda p: _writable(changed, moved))
+    monkeypatch.setattr(mod, "list_accounts", lambda *a, **k: pytest.fail("no verification read after a decline"))
+    report = mod.auto_rotate()
+    assert moved == []
+    assert report["declined"] and report["declined"]["account"] == "fresh@x" and "dead" in report["declined"]["reason"]
+    assert report["promoted"] is None and not report.get("changed") and report["ok"] is True
+    assert "order unchanged" in mod.render_auto(report)
+
+
+def test_manual_switch_keeps_label_resolution_and_does_not_require_eligibility(mod, monkeypatch):
+    moved = []
+    entries = [_pool_entry(0, "busy@x"), _pool_entry(1, "fresh@x", status="exhausted")]
+    monkeypatch.setattr(mod, "_load_writable_pool", lambda p: _writable(entries, moved))
+    assert mod._move_to_front("anthropic", _acct(mod, 1, "fresh@x")) is None
+    assert moved == [("id1", 0)]
+
+
+# -- desktop rows: exact entry id, typed commands keep friendly matching ------------------------
+
+def _collision_accounts(mod):
+    # row 1's LABEL is "id1", which is row 2's entry ID
+    a = mod.Account(index=1, label="id1", auth_type="oauth", id="idX", priority=0, source="hermes_pkce")
+    b = mod.Account(index=2, label="real@x", auth_type="oauth", id="id1", priority=1, source="hermes_pkce")
+    return [a, b]
+
+
+def test_typed_switch_by_label_or_id_still_uses_the_friendly_matcher(mod, monkeypatch):
+    accts = _collision_accounts(mod)
+    monkeypatch.setattr(mod, "_read_accounts", lambda p: (p, accts))
+    monkeypatch.setattr(mod, "_pool_strategy", lambda p: "fill_first")
+    assert mod.switch("id1", dry_run=True)["account"] == "id1"  # ordinary matcher: label match wins (typed command)
+    assert mod.switch("real", dry_run=True)["account"] == "real@x"  # unique prefix still works
+    assert mod.switch("#2", dry_run=True)["account"] == "real@x"
+
+
+def test_desktop_row_click_never_switches_the_label_twin(mod, monkeypatch, capsys):
+    accts = _collision_accounts(mod)
+    monkeypatch.setattr(mod, "_read_accounts", lambda p: (p, accts))
+    monkeypatch.setattr(mod, "_pool_strategy", lambda p: "fill_first")
+    monkeypatch.setattr(mod, "_move_to_front", lambda *a, **k: pytest.fail("ambiguous exact id must not move anything"))
+    args = SimpleNamespace(cmd="switch", target="id1", provider="anthropic", dry_run=False, exact_id=True)
+    mod._handle_cli(args)
+    out = capsys.readouterr().out
+    assert "Switch failed" in out and "collides" in out
+
+
+def test_desktop_row_click_moves_exactly_the_clicked_entry(mod, monkeypatch, capsys):
+    accts = [mod.Account(index=1, label="a@x", auth_type="oauth", id="idA", priority=0, source="hermes_pkce"),
+             mod.Account(index=2, label="b@x", auth_type="oauth", id="idB", priority=1, source="hermes_pkce")]
+    monkeypatch.setattr(mod, "_read_accounts", lambda p: (p, accts))
+    monkeypatch.setattr(mod, "_pool_strategy", lambda p: "fill_first")
+    moved = []
+    monkeypatch.setattr(mod, "_move_to_front", lambda p, a, **k: moved.append((a.id, k)))
+    monkeypatch.setattr(mod, "list_accounts", lambda *a, **k: {"accounts": [
+        {"label": "b@x", "id": "idB", "priority": 0}, {"label": "a@x", "id": "idA", "priority": 1}]})
+    mod._handle_cli(SimpleNamespace(cmd="switch", target="idB", provider="anthropic", dry_run=False, exact_id=True))
+    assert moved == [("idB", {"exact_id": True})]
+    assert "Switched" in capsys.readouterr().out
+
+
+def test_cli_parser_accepts_exact_id_and_the_desktop_passes_it(mod):
+    p = _argparse.ArgumentParser()
+    mod._setup_argparse(p)
+    ns = p.parse_args(["switch", "--exact-id", "id1"])
+    assert ns.exact_id is True and ns.target == "id1"
+    assert p.parse_args(["switch", "id1"]).exact_id is False
+    js = PLUGIN_JS.read_text()
+    assert "'switch', '--exact-id', row.id" in js  # row clicks carry the entry id as an exact id
