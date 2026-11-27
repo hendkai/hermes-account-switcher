@@ -185,22 +185,25 @@ def test_usage_uses_public_helper_and_skips_dead(mod, monkeypatch):
     W = lambda label, pct, scope="account": SimpleNamespace(label=label, used_percent=pct, scope=scope)
     calls = []
 
-    def fake_fetch(provider, *, api_key=None, read_only=False, **kw):
-        calls.append((provider, api_key, read_only))
+    def fake_fetch(provider, *, api_key=None, read_only=False, identity_id=None, **kw):
+        calls.append((provider, api_key, read_only, identity_id))
         return SimpleNamespace(windows=[W("Current session", 12.0), W("Current week", 0.0),
                                         W("Fable weekly", 100.0, "model")])
 
     _fake_module(monkeypatch, "agent.account_usage", fetch_account_usage=fake_fetch)
-    entries = [SimpleNamespace(label=l, auth_type="oauth", access_token=f"tok-{l}") for l in ("ok@x", "dead@x", "bench@x")]
+    entries = [SimpleNamespace(id=f"id{i}", label=l, auth_type="oauth", access_token=f"tok-{l}")
+               for i, l in enumerate(("ok@x", "dead@x", "bench@x"))]
     monkeypatch.setattr(mod, "_load_pool", lambda p: SimpleNamespace(entries=lambda: entries))
     accounts = [_acct(mod, 0, "ok@x"), _acct(mod, 1, "dead@x", status="dead"),
                 _acct(mod, 2, "bench@x", status="exhausted", bench_until=time.time() + 600)]
     out = mod._usage_for_accounts(accounts)
-    # read_only; dead logins are skipped, benched ones are read so their bars show why
+    # read_only; dead logins are skipped, benched ones are read so their bars show why;
+    # every call carries the entry id as identity_id so Hermes' usage cache stays per credential
     assert sorted(c[1] for c in calls) == ["tok-bench@x", "tok-ok@x"] and all(c[2] for c in calls)
-    assert out["ok@x"] == {"five_hour": {"used_percent": 12.0}, "week": {"used_percent": 0.0},
-                           "scoped": {"label": "Fable weekly", "used_percent": 100.0, "active": True}}
-    assert "dead@x" not in out
+    assert sorted(c[3] for c in calls) == ["id0", "id2"]
+    assert out["id0"] == {"five_hour": {"used_percent": 12.0}, "week": {"used_percent": 0.0},
+                          "scoped": {"label": "Fable weekly", "used_percent": 100.0, "active": True}}
+    assert "id1" not in out and set(out) == {"id0", "id2"}
 
 
 def test_catalog_build_has_no_auth_store_or_refresh_paths(mod):
@@ -328,6 +331,11 @@ def test_slash_provider_flag_anywhere(mod, monkeypatch):
 
 # -- auto rotation (read-only, catalog build) ---------------------------------------
 
+def _by_id(accounts, usage):
+    """Label-keyed usage -> entry-id-keyed usage, the shape ``_usage_for_accounts`` returns."""
+    return {a.id: usage[a.label] for a in accounts if a.label in usage}
+
+
 def _usage(five=0.0, week=0.0, scoped=None):
     info = {"five_hour": {"used_percent": five}, "week": {"used_percent": week}}
     if scoped is not None:
@@ -339,10 +347,10 @@ def test_auto_promotes_login_with_most_weekly_headroom(mod, monkeypatch):
     accounts = [_acct(mod, 0, "busy@x"), _acct(mod, 1, "fresh@x"), _acct(mod, 2, "dead@x", status="dead"),
                 _acct(mod, 3, "bench@x", status="exhausted", bench_until=time.time() + 600)]
     monkeypatch.setattr(mod, "_read_accounts", lambda p: (p, accounts))
-    monkeypatch.setattr(mod, "_usage_for_accounts", lambda accs, p: {
-        "busy@x": _usage(five=10, week=60), "fresh@x": _usage(five=40, week=0)})
+    monkeypatch.setattr(mod, "_usage_for_accounts", lambda accs, p: _by_id(accounts, {
+        "busy@x": _usage(five=10, week=60), "fresh@x": _usage(five=40, week=0)}))
     promoted = []
-    monkeypatch.setattr(mod, "switch", lambda target, provider="anthropic", dry_run=False:
+    monkeypatch.setattr(mod, "switch", lambda target, provider="anthropic", dry_run=False, **kw:
                         promoted.append(target) or {"ok": True})
     monkeypatch.setattr(mod, "list_accounts", lambda p="anthropic", with_usage=True: {
         "accounts": [{"label": "fresh@x"}, {"label": "busy@x"}]})
@@ -357,8 +365,8 @@ def test_auto_promotes_login_with_most_weekly_headroom(mod, monkeypatch):
 def test_auto_skips_exhausted_and_dry_run_moves_nothing(mod, monkeypatch):
     accounts = [_acct(mod, 0, "full@x"), _acct(mod, 1, "spare@x"), _acct(mod, 2, "unknown@x")]
     monkeypatch.setattr(mod, "_read_accounts", lambda p: (p, accounts))
-    monkeypatch.setattr(mod, "_usage_for_accounts", lambda accs, p: {
-        "full@x": _usage(five=100, week=20), "spare@x": _usage(five=5, week=30)})
+    monkeypatch.setattr(mod, "_usage_for_accounts", lambda accs, p: _by_id(accounts, {
+        "full@x": _usage(five=100, week=20), "spare@x": _usage(five=5, week=30)}))
     monkeypatch.setattr(mod, "switch", lambda *a, **k: pytest.fail("dry run must not switch"))
     report = mod.auto_rotate(dry_run=True)
     assert report["exhausted"] == ["full@x"] and report["unknown"] == ["unknown@x"]
@@ -367,9 +375,10 @@ def test_auto_skips_exhausted_and_dry_run_moves_nothing(mod, monkeypatch):
 
 def _run_auto(mod, monkeypatch, accounts, usage, dry_run=True):
     monkeypatch.setattr(mod, "_read_accounts", lambda p: (p, accounts))
-    monkeypatch.setattr(mod, "_usage_for_accounts", lambda accs, p: usage)
+    by_id = _by_id(accounts, usage)
+    monkeypatch.setattr(mod, "_usage_for_accounts", lambda accs, p: by_id)
     promoted = []
-    monkeypatch.setattr(mod, "switch", lambda target, provider="anthropic", dry_run=False:
+    monkeypatch.setattr(mod, "switch", lambda target, provider="anthropic", dry_run=False, **kw:
                         promoted.append(target) or {"ok": True})
     monkeypatch.setattr(mod, "list_accounts", lambda p="anthropic", with_usage=True: {"accounts": []})
     return mod.auto_rotate(dry_run=dry_run), promoted
@@ -437,8 +446,8 @@ def test_auto_explicit_reset_bench_is_still_respected_and_expired_is_not(mod, mo
 def test_auto_already_first_is_not_moved(mod, monkeypatch):
     accounts = [_acct(mod, 0, "best@x"), _acct(mod, 1, "other@x")]
     monkeypatch.setattr(mod, "_read_accounts", lambda p: (p, accounts))
-    monkeypatch.setattr(mod, "_usage_for_accounts", lambda accs, p: {
-        "best@x": _usage(week=5), "other@x": _usage(week=50)})
+    monkeypatch.setattr(mod, "_usage_for_accounts", lambda accs, p: _by_id(accounts, {
+        "best@x": _usage(week=5), "other@x": _usage(week=50)}))
     monkeypatch.setattr(mod, "switch", lambda *a, **k: pytest.fail("already first: nothing to move"))
     report = mod.auto_rotate()
     assert report["promoted"] == "best@x"
@@ -457,7 +466,7 @@ def test_pool_status_usage_only_when_asked(mod, monkeypatch):
     monkeypatch.setattr(mod, "_pool_strategy", lambda p: "fill_first")
     monkeypatch.setattr(mod, "_read_accounts", lambda p: (p, [_acct(mod, 0, "a@x")]))
     calls = []
-    monkeypatch.setattr(mod, "_usage_for_accounts", lambda accs, p: calls.append(p) or {"a@x": _usage(week=7)})
+    monkeypatch.setattr(mod, "_usage_for_accounts", lambda accs, p: calls.append(p) or {"id0": _usage(week=7)})
     plain = mod.pool_status()
     assert calls == [] and plain["accounts"][0]["usage"] is None and plain["usage_available"] is False
     rich = mod.pool_status(with_usage=True)
@@ -471,8 +480,8 @@ def test_pool_status_usage_only_when_asked(mod, monkeypatch):
 def test_auto_keeps_current_login_within_margin(mod, monkeypatch):
     accounts = [_acct(mod, 0, "cur@x"), _acct(mod, 1, "alt@x")]
     monkeypatch.setattr(mod, "_read_accounts", lambda p: (p, accounts))
-    monkeypatch.setattr(mod, "_usage_for_accounts", lambda accs, p: {
-        "cur@x": _usage(week=30), "alt@x": _usage(week=27)})  # 3 points better: not worth a swap
+    monkeypatch.setattr(mod, "_usage_for_accounts", lambda accs, p: _by_id(accounts, {
+        "cur@x": _usage(week=30), "alt@x": _usage(week=27)}))  # 3 points better: not worth a swap
     monkeypatch.setattr(mod, "switch", lambda *a, **k: pytest.fail("within margin: no swap"))
     report = mod.auto_rotate()
     assert report["promoted"] == "cur@x" and not report.get("changed")
@@ -481,8 +490,8 @@ def test_auto_keeps_current_login_within_margin(mod, monkeypatch):
 def test_auto_swaps_when_clearly_better_and_reports_changed(mod, monkeypatch):
     accounts = [_acct(mod, 0, "cur@x"), _acct(mod, 1, "alt@x")]
     monkeypatch.setattr(mod, "_read_accounts", lambda p: (p, accounts))
-    monkeypatch.setattr(mod, "_usage_for_accounts", lambda accs, p: {
-        "cur@x": _usage(week=40), "alt@x": _usage(week=10)})
+    monkeypatch.setattr(mod, "_usage_for_accounts", lambda accs, p: _by_id(accounts, {
+        "cur@x": _usage(week=40), "alt@x": _usage(week=10)}))
     monkeypatch.setattr(mod, "switch", lambda *a, **k: {"ok": True})
     monkeypatch.setattr(mod, "list_accounts", lambda p="anthropic", with_usage=True: {"accounts": []})
     report = mod.auto_rotate()
@@ -567,7 +576,7 @@ def test_usage_includes_benched_logins_but_not_dead(mod, monkeypatch):
     accounts = [_acct(mod, 0, "ok@x"), _acct(mod, 1, "bench@x", status="exhausted", bench_until=time.time() + 600),
                 _acct(mod, 2, "dead@x", status="dead")]
     seen = []
-    entries = [SimpleNamespace(label=a.label, access_token="tok-" + a.label, auth_type="oauth") for a in accounts]
+    entries = [SimpleNamespace(id=a.id, label=a.label, access_token="tok-" + a.label, auth_type="oauth") for a in accounts]
     monkeypatch.setattr(mod, "_load_pool", lambda p: SimpleNamespace(entries=lambda: entries))
     win = lambda label, pct, scope="account": SimpleNamespace(label=label, used_percent=pct, scope=scope)
     fake = types.ModuleType("agent.account_usage")
@@ -578,7 +587,225 @@ def test_usage_includes_benched_logins_but_not_dead(mod, monkeypatch):
     monkeypatch.setitem(sys.modules, "agent.account_usage", fake)
     monkeypatch.setitem(sys.modules, "agent", types.ModuleType("agent"))
     out = mod._usage_for_accounts(accounts)
-    assert set(out) == {"ok@x", "bench@x"} and sorted(seen) == ["tok-bench@x", "tok-ok@x"]
-    assert out["ok@x"]["five_hour"]["used_percent"] == 12.0
-    assert out["ok@x"]["week"]["used_percent"] == 34.0
-    assert out["ok@x"]["scoped"]["used_percent"] == 80.0  # tightest model cap wins
+    assert set(out) == {"id0", "id1"} and sorted(seen) == ["tok-bench@x", "tok-ok@x"]
+    assert out["id0"]["five_hour"]["used_percent"] == 12.0
+    assert out["id0"]["week"]["used_percent"] == 34.0
+    assert out["id0"]["scoped"]["used_percent"] == 80.0  # tightest model cap wins
+    assert out["id0"]["scoped"]["label"] == "Sonnet week"  # family label kept, not a generic "model"
+
+
+# -- review follow-up: fresh eligibility, entry-id keys, display ------------------------
+
+def _seq_reads(monkeypatch, mod, first, later):
+    """_read_accounts: the first call sees *first*, every later call *later*."""
+    state = {"n": 0}
+
+    def reader(p):
+        state["n"] += 1
+        return p, (first if state["n"] == 1 else later)
+
+    monkeypatch.setattr(mod, "_read_accounts", reader)
+    return state
+
+
+@pytest.mark.parametrize("kind", ["cooldown_unknown", "benched", "dead"])
+def test_auto_declines_winner_that_became_ineligible_after_the_usage_fetch(mod, monkeypatch, kind):
+    busy, fresh = _acct(mod, 0, "busy@x"), _acct(mod, 1, "fresh@x")
+    first = [busy, fresh]
+    changed = {
+        "cooldown_unknown": _acct(mod, 1, "fresh@x", status="exhausted", bench_unknown=True,
+                                  notes=["(cooldown unknown)"]),
+        "benched": _acct(mod, 1, "fresh@x", status="exhausted", bench_until=time.time() + 600,
+                         notes=["(10m left)"]),
+        "dead": _acct(mod, 1, "fresh@x", status="dead"),
+    }[kind]
+    state = _seq_reads(monkeypatch, mod, first, [busy, changed])
+    monkeypatch.setattr(mod, "_usage_for_accounts", lambda accs, p: _by_id(first, {
+        "busy@x": _usage(week=90), "fresh@x": _usage(week=0)}))
+    monkeypatch.setattr(mod, "_pool_strategy", lambda p: "fill_first")
+    monkeypatch.setattr(mod, "_move_to_front", lambda *a: pytest.fail("a declined winner must not be moved"))
+    monkeypatch.setattr(mod, "list_accounts", lambda *a, **k: pytest.fail("nothing moved: no re-list"))
+    report = mod.auto_rotate(dry_run=False)
+    assert state["n"] >= 2  # the pool was re-read before the move
+    assert report["ok"] is True and report["promoted"] is None and not report.get("changed")
+    assert report["declined"]["account"] == "fresh@x" and report["declined"]["reason"]
+    text = mod.render_auto(report)
+    assert "fresh@x looked eligible" in text and "order unchanged this run" in text
+    assert "priority 0 →" not in text and "No login is usage-eligible" not in text
+
+
+def test_manual_switch_can_still_override_a_benched_or_unknown_cooldown_login(mod, monkeypatch):
+    accounts = [_acct(mod, 0, "a@x"),
+                _acct(mod, 1, "u@x", status="exhausted", bench_unknown=True, notes=["(cooldown unknown)"])]
+    monkeypatch.setattr(mod, "_read_accounts", lambda p: (p, accounts))
+    monkeypatch.setattr(mod, "_pool_strategy", lambda p: "fill_first")
+    moved = []
+    monkeypatch.setattr(mod, "_move_to_front", lambda p, a: moved.append(a.id))
+    monkeypatch.setattr(mod, "list_accounts", lambda *a, **k: {"accounts": []})
+    plan = mod.switch("u@x")
+    assert moved == ["id1"] and plan["ok"] is True and "cooldown is unknown" in plan["warning"]
+    # the same login is declined only when the caller asks for the eligibility check
+    moved.clear()
+    declined = mod.switch("u@x", require_eligible=True)
+    assert declined["ok"] is False and declined["declined"] is True and moved == []
+
+
+def test_auto_moves_winner_that_is_still_eligible_on_the_fresh_read(mod, monkeypatch):
+    accounts = [_acct(mod, 0, "busy@x"), _acct(mod, 1, "fresh@x")]
+    monkeypatch.setattr(mod, "_read_accounts", lambda p: (p, accounts))
+    monkeypatch.setattr(mod, "_usage_for_accounts", lambda accs, p: _by_id(accounts, {
+        "busy@x": _usage(week=90), "fresh@x": _usage(week=0)}))
+    monkeypatch.setattr(mod, "_pool_strategy", lambda p: "fill_first")
+    moved = []
+    monkeypatch.setattr(mod, "_move_to_front", lambda p, a: moved.append(a.id))
+    monkeypatch.setattr(mod, "list_accounts", lambda *a, **k: {"accounts": [
+        {"label": "fresh@x", "id": "id1", "priority": 0}, {"label": "busy@x", "id": "id0", "priority": 1}]})
+    report = mod.auto_rotate()
+    assert moved == ["id1"] and report["promoted"] == "fresh@x" and report["changed"] is True
+    assert report["declined"] is None
+
+
+def _dup_entries():
+    return [SimpleNamespace(id="idA", label="same@x", auth_type="oauth", access_token="tok-A"),
+            SimpleNamespace(id="idB", label="same@x", auth_type="oauth", access_token="tok-B")]
+
+
+def test_duplicate_labels_keep_separate_usage_and_pass_identity_id(mod, monkeypatch):
+    win = lambda label, pct, scope="account": SimpleNamespace(label=label, used_percent=pct, scope=scope)
+    calls = []
+
+    def fake_fetch(provider, *, api_key=None, read_only=False, identity_id=None, **kw):
+        calls.append((api_key, identity_id))
+        if api_key == "tok-A":
+            return SimpleNamespace(windows=[win("Current session", 10.0), win("Current week", 70.0)])
+        return SimpleNamespace(windows=[win("Opus week", 3.0, "model")])  # scoped-only
+
+    _fake_module(monkeypatch, "agent.account_usage", fetch_account_usage=fake_fetch)
+    entries = _dup_entries()
+    monkeypatch.setattr(mod, "_load_pool", lambda p: SimpleNamespace(entries=lambda: entries))
+    accounts = [mod.Account(index=1, label="same@x", auth_type="oauth", id="idA", priority=0, source="hermes_pkce"),
+                mod.Account(index=2, label="same@x", auth_type="oauth", id="idB", priority=1, source="hermes_pkce")]
+    out = mod._usage_for_accounts(accounts)
+    assert sorted(calls) == [("tok-A", "idA"), ("tok-B", "idB")]
+    assert set(out) == {"idA", "idB"}  # nothing overwritten by the shared label
+    assert out["idA"]["week"]["used_percent"] == 70.0 and "week" not in out["idB"]
+    assert out["idB"] == {"scoped": {"label": "Opus week", "used_percent": 3.0, "active": False}}
+
+
+def test_duplicate_labels_scoped_only_row_never_borrows_headroom_or_gets_promoted(mod, monkeypatch):
+    accounts = [mod.Account(index=1, label="same@x", auth_type="oauth", id="idA", priority=0, source="hermes_pkce"),
+                mod.Account(index=2, label="same@x", auth_type="oauth", id="idB", priority=1, source="hermes_pkce")]
+    usage = {"idA": _usage(week=70), "idB": {"scoped": {"label": "Opus week", "used_percent": 3.0, "active": False}}}
+    monkeypatch.setattr(mod, "_read_accounts", lambda p: (p, accounts))
+    monkeypatch.setattr(mod, "_usage_for_accounts", lambda accs, p: usage)
+    monkeypatch.setattr(mod, "switch", lambda *a, **k: pytest.fail("the scoped-only twin must not be promoted"))
+    report = mod.auto_rotate(dry_run=False)
+    assert report["alive"] == ["same@x (#1)"] and report["unknown"] == ["same@x (#2)"]
+    assert report["unknown_reason"] == {"same@x (#2)": "scoped_only"}
+    assert report["promoted"] == "same@x (#1)" and report["would_promote"] is None
+    text = mod.render_auto(report)
+    assert "same@x (#2) only model-scoped usage" in text
+
+
+def test_duplicate_labels_promote_the_right_entry_id(mod, monkeypatch):
+    accounts = [mod.Account(index=1, label="same@x", auth_type="oauth", id="idA", priority=0, source="hermes_pkce"),
+                mod.Account(index=2, label="same@x", auth_type="oauth", id="idB", priority=1, source="hermes_pkce")]
+    usage = {"idA": _usage(week=80), "idB": _usage(week=5)}
+    monkeypatch.setattr(mod, "_read_accounts", lambda p: (p, accounts))
+    monkeypatch.setattr(mod, "_usage_for_accounts", lambda accs, p: usage)
+    monkeypatch.setattr(mod, "_pool_strategy", lambda p: "fill_first")
+    moved = []
+    monkeypatch.setattr(mod, "_move_to_front", lambda p, a: moved.append(a.id))
+    monkeypatch.setattr(mod, "list_accounts", lambda *a, **k: {"accounts": [
+        {"label": "same@x", "id": "idB", "priority": 0}, {"label": "same@x", "id": "idA", "priority": 1}]})
+    report = mod.auto_rotate()
+    assert moved == ["idB"] and report["promoted"] == "same@x (#2)"
+
+
+def test_list_and_status_attach_usage_by_entry_id_not_label(mod, monkeypatch):
+    accounts = [mod.Account(index=1, label="same@x", auth_type="oauth", id="idA", priority=0, source="hermes_pkce"),
+                mod.Account(index=2, label="same@x", auth_type="oauth", id="idB", priority=1, source="hermes_pkce")]
+    usage = {"idA": _usage(week=11), "idB": _usage(week=22)}
+    monkeypatch.setattr(mod, "_read_accounts", lambda p: (p, accounts))
+    monkeypatch.setattr(mod, "_pool_strategy", lambda p: "fill_first")
+    monkeypatch.setattr(mod, "_usage_for_accounts", lambda accs, p: usage)
+    listed = mod.list_accounts("anthropic")
+    assert [a["usage"]["week"]["used_percent"] for a in listed["accounts"]] == [11, 22]
+    rows = mod.pool_status(with_usage=True)["accounts"]
+    assert [r["id"] for r in rows] == ["idA", "idB"]
+    assert [r["usage"]["week"]["used_percent"] for r in rows] == [11, 22]
+
+
+def test_auto_output_names_only_measured_windows(mod, monkeypatch):
+    accounts = [_acct(mod, 0, "both@x"), _acct(mod, 1, "weekonly@x"), _acct(mod, 2, "fiveonly@x")]
+    usage = {"both@x": _usage(five=5, week=50),
+             "weekonly@x": {"week": {"used_percent": 20.0}},
+             "fiveonly@x": {"five_hour": {"used_percent": 20.0}}}
+    report, _ = _run_auto(mod, monkeypatch, accounts, usage)
+    assert report["measured"] == {"both@x": ["5h", "week"], "weekonly@x": ["week"], "fiveonly@x": ["5h"]}
+    lines = {l.split()[1]: l for l in mod.render_auto(report).splitlines() if l.startswith("✓")}
+    assert "(5h/week below 100%;" in lines["both@x"]
+    assert "(week below 100%; 5h not measured;" in lines["weekonly@x"] and "5h/week" not in lines["weekonly@x"]
+    assert "(5h below 100%; week not measured;" in lines["fiveonly@x"]
+
+
+def test_render_keeps_model_family_label_and_unknown_cooldown(mod):
+    text = mod.render_list({"provider": "anthropic", "usage_available": True, "accounts": [
+        {"index": 1, "label": "a@x", "priority": 0, "current": True, "status": "ok",
+         "usage": {"week": {"used_percent": 10}, "scoped": {"label": "Opus week", "used_percent": 100,
+                                                          "active": True}}},
+        {"index": 2, "label": "u@x", "priority": 1, "current": False, "status": "exhausted",
+         "benched": "(cooldown unknown)"}]})
+    assert "Opus week 100%" in text and "model cap reached" in text
+    assert "benched (cooldown unknown)" in text
+    auto = mod.render_auto({"ok": True, "provider": "anthropic", "alive": ["a@x"], "exhausted": [], "benched": [],
+                            "cooldown_unknown": ["u@x"], "dead": [], "unknown": [], "measured": {"a@x": ["week"]},
+                            "scoped_caps": {"a@x": "Opus week"}, "promoted": "a@x"})
+    assert "Opus week" in auto and "u@x exhausted, cooldown unknown" in auto
+
+
+# -- desktop half: pure helpers run in node with stubbed SDK imports ----------------
+
+import json as _json
+import shutil as _shutil
+import subprocess as _subprocess
+
+PLUGIN_JS = Path(__file__).resolve().parents[1] / "desktop" / "plugin.js"
+
+
+@pytest.mark.skipif(_shutil.which("node") is None, reason="node not installed")
+def test_desktop_chip_shows_unknown_cooldown_and_model_family_label(tmp_path):
+    src = PLUGIN_JS.read_text()
+    src = src.replace("import * as sdk from '@hermes/plugin-sdk'", "const sdk = new Proxy({}, {get: () => () => null})")
+    src = src.replace("import { useState } from 'react'", "const useState = () => [false, () => {}]")
+    src = src.replace("import { jsx, jsxs } from 'react/jsx-runtime'",
+                      "const jsx = (type, props, key) => ({ type, props, key }); const jsxs = jsx")
+    src = src.replace("export default {", "globalThis.__plugin = {")
+    probe = """
+const en = MESSAGES.en
+const t = (k, ...a) => (typeof en[k] === 'function' ? en[k](...a) : en[k])
+const flat = (n) => (n == null || typeof n !== 'object') ? String(n ?? '') :
+  Array.isArray(n) ? n.map(flat).join('|') :
+  typeof n.type === 'function' ? flat(n.type(n.props)) :
+  [flat(n.props?.children), n.props?.title ?? ''].join('|')
+const out = {
+  unknown: rowState({ status: 'benched', cooldown_unknown: true, bench_left: null }, t),
+  timed: rowState({ status: 'benched', cooldown_unknown: false, bench_left: '10m' }, t),
+  plain: rowState({ status: 'benched' }, t),
+  bars: flat(UsageBars({ usage: { week: { used_percent: 10 },
+        scoped: { label: 'Opus week', used_percent: 100 } }, t })),
+  fallback: flat(UsageBars({ usage: { scoped: { used_percent: 5 } }, t })),
+  de: MESSAGES.de.cooldownUnknown
+}
+console.log(JSON.stringify(out))
+"""
+    f = tmp_path / "probe.mjs"
+    f.write_text(src + "\n" + probe)
+    res = _subprocess.run(["node", str(f)], capture_output=True, text=True, timeout=30)
+    assert res.returncode == 0, res.stderr
+    out = _json.loads(res.stdout.strip().splitlines()[-1])
+    assert out["unknown"] == "benched \u00b7 cooldown unknown"
+    assert out["timed"] == "benched 10m" and out["plain"] == "benched"
+    assert "Opus week" in out["bars"] and "model" not in out["bars"].replace("Opus week", "")
+    assert "model" in out["fallback"]  # generic label only when the backend sent none
+    assert "Cooldown" in out["de"]

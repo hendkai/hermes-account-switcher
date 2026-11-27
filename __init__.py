@@ -18,9 +18,11 @@ How it touches Hermes:
   and parsing their output. Switching = "move to priority 0", i.e. that
   account is tried first on the next model call (``fill_first`` strategy).
 * **Usage percentages** (list only) go through Hermes' public
-  ``fetch_account_usage(read_only=True)``: each usable pooled OAuth token is sent to the provider's own API (api.anthropic.com) by
-  that helper. Dead logins are skipped; nothing is
-  refreshed, rotated or written.
+  ``fetch_account_usage(read_only=True, identity_id=<entry id>)``: each usable
+  pooled OAuth token is sent to the provider's own API (api.anthropic.com) by
+  that helper. Dead logins are skipped; no token is refreshed or rotated and no
+  cooldown or bench state is written. Hermes' own usage cache may remember the
+  returned snapshot, per credential.
 * **Auto rotation** (``auto``) uses the same usage data and ``switch`` (the
   pool's ``move_entry``) to promote the login with the most headroom. It runs
   only when you opt in (``plugins.credential-pool-switcher.auto_rotate: true``
@@ -41,6 +43,7 @@ Tokens are never printed, logged, returned, or written by this plugin.
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import math
@@ -397,18 +400,30 @@ def _read_accounts(provider: str) -> Tuple[str, List[Account]]:
 
 # -- usage (public helper) ---------------------------------------------------------
 
+def _fetch_supports_identity(fetch) -> bool:
+    """True when the public helper accepts ``identity_id`` (older cores do not)."""
+    try:
+        params = inspect.signature(fetch).parameters
+    except (TypeError, ValueError):
+        return False
+    return "identity_id" in params or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
 def _usage_for_accounts(accounts: List[Account], provider: str = DEFAULT_PROVIDER) -> Optional[dict]:
     """Best-effort per-account usage for the list view.
 
     Uses Hermes' public ``fetch_account_usage(read_only=True)``: it never
-    refreshes, rotates or benches a pool entry. Dead logins are skipped (their
-    token is useless); benched ones are still read, so their bars show why.
-    An expired idle login simply shows no percentages.
+    refreshes, rotates or benches a pool entry (its only side effect is Hermes'
+    own usage cache remembering the snapshot, which is why the entry id is passed
+    as ``identity_id`` where supported: the cache then stays per credential).
+    Dead logins are skipped (their token is useless); benched ones are still
+    read, so their bars show why. An expired idle login simply shows no percentages.
     ``five_hour`` / ``week`` are account-level windows; ``scoped`` is the tightest
     model-family cap and is informational for model-agnostic decisions.
-    Returns ``{label: {"five_hour": ..., "week": ..., "scoped": {...}}}`` or None.
+    Returns ``{entry_id: {"five_hour": ..., "week": ..., "scoped": {...}}}`` or None.
+    Keys are stable credential entry ids, never display labels: labels can repeat.
     """
-    wanted = {a.label for a in accounts
+    wanted = {a.id for a in accounts
               if a.auth_type == "oauth" and a.status != STATUS_DEAD}
     if not wanted:
         return None
@@ -420,16 +435,20 @@ def _usage_for_accounts(accounts: List[Account], provider: str = DEFAULT_PROVIDE
     pool = _load_pool(provider)
     if pool is None:
         return None
+    with_identity = _fetch_supports_identity(fetch_account_usage)
     out: dict = {}
     for entry in pool.entries():
-        label = str(getattr(entry, "label", "") or "")
+        entry_id = str(getattr(entry, "id", "") or "")
         token = (getattr(entry, "access_token", "") or "").strip()
-        if label not in wanted or getattr(entry, "auth_type", "") != "oauth" or not token:
+        if not entry_id or entry_id not in wanted or getattr(entry, "auth_type", "") != "oauth" or not token:
             continue
         try:
-            snap = fetch_account_usage(provider, api_key=token, read_only=True)
+            if with_identity:
+                snap = fetch_account_usage(provider, api_key=token, read_only=True, identity_id=entry_id)
+            else:
+                snap = fetch_account_usage(provider, api_key=token, read_only=True)
         except Exception as exc:
-            log.debug("usage fetch for %s failed: %s", label, type(exc).__name__)
+            log.debug("usage fetch for entry %s failed: %s", entry_id, type(exc).__name__)
             continue
         if snap is None:
             continue
@@ -449,7 +468,7 @@ def _usage_for_accounts(accounts: List[Account], provider: str = DEFAULT_PROVIDE
             elif "week" in name:
                 windows["week"] = {"used_percent": pct}
         if windows:
-            out[label] = windows
+            out[entry_id] = windows
     return out or None
 
 
@@ -476,7 +495,7 @@ def list_accounts(provider: str = DEFAULT_PROVIDER, with_usage: bool = True) -> 
                 "status": a.status,
                 "needs_login": a.status == STATUS_DEAD,
                 "benched": a.notes[0] if (a.notes and a.status != STATUS_DEAD) else None,
-                **({"usage": (usage or {}).get(a.label)} if usage else {}),
+                **({"usage": (usage or {}).get(a.id)} if usage else {}),
             }
             for a in accounts
         ],
@@ -604,6 +623,7 @@ def pool_status(provider: str = DEFAULT_PROVIDER, with_usage: bool = False) -> d
         rows.append({
             "index": a.index,
             "label": a.label,
+            "id": a.id,
             "priority": a.priority,
             "auth_type": a.auth_type,
             "source": a.source,
@@ -618,7 +638,7 @@ def pool_status(provider: str = DEFAULT_PROVIDER, with_usage: bool = False) -> d
             "switchable": (status == "ok" and _switch_blocker(a, provider) is None
                            and not (active is not None and a.id == active.id)),
             "relogin_hint": _relogin_hint(provider, a.label, a.source) if status == "dead" else None,
-            "usage": (usage or {}).get(a.label) if usage else None,
+            "usage": (usage or {}).get(a.id) if usage else None,
         })
     return {
         "provider": provider,
@@ -678,14 +698,31 @@ def _move_to_front(provider: str, account: Account) -> Optional[str]:
     return None
 
 
+def _ineligible_reason(account: Account, now: float) -> Optional[str]:
+    """Why Hermes would not use *account* right now (dead / benched), or None."""
+    if account.status == STATUS_DEAD:
+        return "dead (re-login needed)"
+    if account.bench_unknown:
+        return "benched with an unknown cooldown"
+    if _is_benched(account, now):
+        return "benched by Hermes until its reset"
+    return None
+
+
 def switch(
     target: str,
     provider: str = DEFAULT_PROVIDER,
     dry_run: bool = False,
+    *,
+    require_eligible: bool = False,
 ) -> dict:
     """Move *target* to priority 0 so the pool tries it first.
 
     Returns a plan when dry_run is true, otherwise performs the switch.
+    A manual switch may still pick a benched login (it only warns). With
+    ``require_eligible`` (used by auto rotation) the pool is re-read and a login
+    that is dead, benched or of unknown cooldown *now* is declined, not moved:
+    ``{"ok": False, "declined": True, "reason": ...}``.
     """
     _, accounts = _read_accounts(provider)
     if not accounts:
@@ -698,6 +735,11 @@ def switch(
             "error": f"No account matches '{target}'. Use /switch list to see accounts.",
             "known": [a.safe_label for a in accounts],
         }
+    if require_eligible:
+        reason = _ineligible_reason(account, time.time())
+        if reason:
+            return {"ok": False, "declined": True, "account": account.safe_label, "reason": reason,
+                    "error": f"{account.safe_label} is now {reason}; order left unchanged"}
     blocker = _switch_blocker(account, provider)
     if blocker:
         return {"ok": False, "error": blocker}
@@ -773,7 +815,9 @@ def auto_rotate(provider: str = DEFAULT_PROVIDER, *, dry_run: bool = False) -> d
     """Usage-based rotation: move the login with the most headroom to priority 0.
 
     Reads usage through the public helper and reorders with :func:`switch`
-    (the pool's ``move_entry``). It never benches, refreshes or writes tokens,
+    (the pool's ``move_entry``) with ``require_eligible``: the pool is re-read right
+    before the move and a winner that is now dead, benched or of unknown cooldown is
+    declined (``report["declined"]``), not moved. It never benches, refreshes or writes tokens,
     and sends no message request: a login Hermes' own pool benched after a 429
     is only skipped here. Ranking uses account-level windows only (5h, week); a
     model-family cap is reported (``scoped_caps``) but does not exclude a login.
@@ -786,64 +830,78 @@ def auto_rotate(provider: str = DEFAULT_PROVIDER, *, dry_run: bool = False) -> d
     if not accounts:
         return {"ok": False, "error": f"No credentials found for provider '{provider}'. "
                                       f"Add an account: {_add_hint(provider)}"}
-    usage = _usage_for_accounts(accounts, provider) or {}
+    usage = _usage_for_accounts(accounts, provider) or {}  # keyed by entry id, never by label
     now = time.time()
+    # Display names: the label, plus the pool position when two entries share a label.
+    label_counts: dict = {}
+    for a in accounts:
+        label_counts[a.label] = label_counts.get(a.label, 0) + 1
+    name_of = {a.id: (a.label if label_counts[a.label] == 1 else f"{a.label} (#{a.index})") for a in accounts}
     report: dict = {
         "ok": True, "dry_run": dry_run, "provider": provider,
         "alive": [], "exhausted": [], "benched": [], "cooldown_unknown": [], "dead": [],
-        "unknown": [], "unknown_reason": {}, "scoped_caps": {}, "relogin": {},
-        "promoted": None, "would_promote": None, "order_after": None,
+        "unknown": [], "unknown_reason": {}, "scoped_caps": {}, "relogin": {}, "measured": {},
+        "promoted": None, "would_promote": None, "declined": None, "order_after": None,
     }
     candidates: List[Account] = []
     for a in accounts:
         if a.auth_type != "oauth":
             continue  # api keys are not part of rotation
+        name = name_of[a.id]
+        info = usage.get(a.id)
         if a.status == STATUS_DEAD:
-            report["dead"].append(a.label)
-            report["relogin"][a.label] = _relogin_hint(provider, a.label, a.source)
+            report["dead"].append(name)
+            report["relogin"][name] = _relogin_hint(provider, a.label, a.source)
         elif a.bench_unknown:
-            report["cooldown_unknown"].append(a.label)  # exhausted, no stored reset: never promoted
+            report["cooldown_unknown"].append(name)  # exhausted, no stored reset: never promoted
         elif _is_benched(a, now):
-            report["benched"].append(a.label)
-        elif a.label not in usage:
-            report["unknown"].append(a.label)
-            report["unknown_reason"][a.label] = "no_usage"
-        elif _exhausted(usage[a.label]):
-            report["exhausted"].append(a.label)
-        elif not _has_account_window(usage[a.label]):
+            report["benched"].append(name)
+        elif info is None:
+            report["unknown"].append(name)
+            report["unknown_reason"][name] = "no_usage"
+        elif _exhausted(info):
+            report["exhausted"].append(name)
+        elif not _has_account_window(info):
             # scoped-only (or empty) snapshot: no proof of account headroom
-            report["unknown"].append(a.label)
-            report["unknown_reason"][a.label] = "scoped_only"
+            report["unknown"].append(name)
+            report["unknown_reason"][name] = "scoped_only"
         else:
-            report["alive"].append(a.label)
+            report["alive"].append(name)
+            report["measured"][name] = [short for key, short in (("five_hour", "5h"), ("week", "week"))
+                                        if isinstance((info.get(key) or {}).get("used_percent"), (int, float))]
             candidates.append(a)
-        scoped = (usage.get(a.label) or {}).get("scoped")
+        scoped = (info or {}).get("scoped")
         if scoped and scoped.get("active") and a.status != STATUS_DEAD:
-            report["scoped_caps"][a.label] = scoped.get("label") or "model cap"
+            report["scoped_caps"][name] = scoped.get("label") or "model cap"
 
     if candidates:
         def _rank(a: Account):
-            return (_window_pct(usage[a.label], "week"), _window_pct(usage[a.label], "five_hour"), a.priority)
+            return (_window_pct(usage[a.id], "week"), _window_pct(usage[a.id], "five_hour"), a.priority)
 
         best = min(candidates, key=_rank)
         current = min(candidates, key=lambda a: a.priority)  # what Hermes would use right now
         # Hysteresis: keep the current login unless the winner is clearly better,
         # so two similar logins do not swap places every run (each swap drops the prompt cache).
-        if (current is not best and _window_pct(usage[current.label], "week")
-                - _window_pct(usage[best.label], "week") < AUTO_SWITCH_MARGIN_PCT):
+        if (current is not best and _window_pct(usage[current.id], "week")
+                - _window_pct(usage[best.id], "week") < AUTO_SWITCH_MARGIN_PCT):
             best = current
         first_priority = min(a.priority for a in accounts if a.status != STATUS_DEAD)
         if best.priority == first_priority:
-            report["promoted"] = best.label  # already first
+            report["promoted"] = name_of[best.id]  # already first
         elif dry_run:
-            report["would_promote"] = best.label
+            report["would_promote"] = name_of[best.id]
         else:
-            plan = switch(best.id, provider)
+            # The usage fetch took time and the pool may have changed since the first
+            # read: switch() re-reads it and declines a login that is now dead,
+            # benched or of unknown cooldown (a manual switch would only warn).
+            plan = switch(best.id, provider, require_eligible=True)
             if plan.get("ok"):
-                report["promoted"] = best.label
+                report["promoted"] = name_of[best.id]
                 report["changed"] = True
                 after = list_accounts(provider, with_usage=False)
                 report["order_after"] = [a["label"] for a in after["accounts"]]
+            elif plan.get("declined"):
+                report["declined"] = {"account": name_of[best.id], "reason": plan.get("reason")}
             else:
                 report["ok"] = False
                 report["error"] = f"promotion failed: {plan.get('error')}"
@@ -1063,9 +1121,14 @@ def render_auto(data: dict, markdown: bool = False) -> str:
         return f"{b}Auto rotation failed{b}: {data.get('error')}"
     lines = [f"{b}Auto rotation ({data['provider']}){b}" + (" — dry run" if data.get("dry_run") else "")]
     caps = data.get("scoped_caps") or {}
+    measured = data.get("measured") or {}
     for label in data["alive"]:
         extra = f" — ⚠ model-scoped cap reached: {caps[label]} (that model family only)" if label in caps else ""
-        lines.append(f"✓ {label} usage-eligible (5h/week below 100%; not verified by a message){extra}")
+        seen = measured.get(label) or []
+        missing = [w for w in ("5h", "week") if w not in seen]
+        scope = "/".join(seen) if seen else "account window"
+        gap = f"; {'/'.join(missing)} not measured" if missing and seen else ""
+        lines.append(f"✓ {label} usage-eligible ({scope} below 100%{gap}; not verified by a message){extra}")
     for label in data["exhausted"]:
         lines.append(f"⛔ {label} account quota exhausted (5h or week at 100%)")
     for label in data["benched"]:
@@ -1084,13 +1147,17 @@ def render_auto(data: dict, markdown: bool = False) -> str:
             lines.append(f"⚠ {label}: model-scoped cap reached: {cap} (that model family only)")
     for label in data["dead"]:
         lines.append(f"✖ {label} dead — log in anew: " + data.get("relogin", {}).get(label, ""))
+    declined = data.get("declined")
+    if declined:
+        lines.append(f"⚠ {declined['account']} looked eligible in the usage snapshot but is now "
+                     f"{declined['reason']}; order unchanged this run")
     if data.get("promoted"):
         lines.append(f"● priority 0 → {data['promoted']}")
         if data.get("order_after"):
             lines.append("New order: " + " → ".join(data["order_after"]))
     elif data.get("would_promote"):
         lines.append(f"Would move {data['would_promote']} to priority 0")
-    elif data.get("ok") and not data["alive"]:
+    elif data.get("ok") and not data["alive"] and not declined:
         lines.append("No login is usage-eligible right now — order unchanged.")
     if data.get("error"):
         lines.append(f"⚠ {data['error']}")

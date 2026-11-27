@@ -50,6 +50,8 @@ const MESSAGES = {
     inUse: 'in use',
     benchedFor: (left) => `benched ${left}`,
     benched: 'benched',
+    cooldownUnknown: 'benched \u00b7 cooldown unknown',
+    cooldownUnknownTip: 'Exhausted, and Hermes stored no reset time: the end of the cooldown is unknown',
     dead: 'log in anew',
     ready: 'ready',
     clickToSwitch: 'Click to use this account first',
@@ -84,6 +86,8 @@ const MESSAGES = {
     inUse: 'aktiv',
     benchedFor: (left) => `gesperrt ${left}`,
     benched: 'gesperrt',
+    cooldownUnknown: 'gesperrt \u00b7 Cooldown unbekannt',
+    cooldownUnknownTip: 'Ersch\u00f6pft, und Hermes hat keine Freigabezeit gespeichert: das Ende der Sperre ist unbekannt',
     dead: 'neu einloggen',
     ready: 'bereit',
     clickToSwitch: 'Klicken, um diesen Account zuerst zu nutzen',
@@ -166,7 +170,10 @@ function rowTone(row) {
 
 function rowState(row, t) {
   if (row.status === 'dead') return t('dead')
-  if (row.status === 'benched') return row.bench_left ? t('benchedFor', row.bench_left) : t('benched')
+  if (row.status === 'benched') {
+    if (row.cooldown_unknown) return t('cooldownUnknown')
+    return row.bench_left ? t('benchedFor', row.bench_left) : t('benched')
+  }
   return row.active ? t('inUse') : t('ready')
 }
 
@@ -187,7 +194,7 @@ function UsageBar({ label, pct }) {
   return jsxs('div', {
     className: 'flex items-center gap-2 text-[0.6875rem] text-(--ui-text-tertiary)',
     children: [
-      jsx('span', { className: 'w-12 shrink-0', children: label }),
+      jsx('span', { className: 'w-16 shrink-0 truncate', title: label, children: label }),
       jsx('div', {
         className: 'h-1.5 min-w-0 flex-1 overflow-hidden rounded-full bg-(--ui-bg-secondary)',
         children: jsx('div', {
@@ -205,7 +212,8 @@ function UsageBars({ usage, t }) {
   const bars = [
     ['five_hour', t('fiveHour')],
     ['week', t('week')],
-    ['scoped', t('scoped')]
+    // Model-family cap: show the family's own label (e.g. "Opus week"), generic text only as a fallback.
+    ['scoped', usage.scoped?.label || t('scoped')]
   ].filter(([key]) => usage[key]?.used_percent != null)
   if (!bars.length) return null
   return jsx('div', {
@@ -235,7 +243,13 @@ function AccountRow({ row, t, onSwitch, busy }) {
     type: 'button',
     disabled: !clickable,
     onClick: clickable ? () => onSwitch(row) : undefined,
-    title: clickable ? t('clickToSwitch') : row.bench_until ? localTime(row.bench_until) : undefined,
+    title: clickable
+      ? t('clickToSwitch')
+      : row.cooldown_unknown
+        ? t('cooldownUnknownTip')
+        : row.bench_until
+          ? localTime(row.bench_until)
+          : undefined,
     className: cn(
       'flex w-full items-center gap-2 rounded-md px-1.5 py-1 text-left',
       clickable ? 'cursor-pointer hover:bg-(--chrome-action-hover)' : 'cursor-default'
@@ -251,7 +265,7 @@ function AccountRow({ row, t, onSwitch, busy }) {
 function Panel({ status, t }) {
   const [busy, setBusy] = useState(false)
   const usage = useUsage()
-  const usageRows = new Map((usage.data?.accounts || []).map((r) => [r.label, r.usage]))
+  const usageRows = new Map((usage.data?.accounts || []).map((r) => [r.id ?? r.label, r.usage]))
   const hasUsage = usageRows.size > 0
 
   const act = async (argv, okMsg, failMsg) => {
@@ -268,7 +282,7 @@ function Panel({ status, t }) {
     }
   }
 
-  const onSwitch = (row) => act(['switch', row.label], t('switched', row.label), (m) => t('switchFailed', m))
+  const onSwitch = (row) => act(['switch', row.id || row.label], t('switched', row.label), (m) => t('switchFailed', m))
   const dead = status.accounts.filter((r) => r.status === 'dead')
 
   return jsxs('div', {
@@ -289,11 +303,11 @@ function Panel({ status, t }) {
             className: 'flex flex-col',
             children: status.accounts.map((row) =>
               jsxs('div', {
-                key: row.label + row.index,
+                key: `${row.id ?? row.label}-${row.index}`,
                 className: 'flex flex-col',
                 children: [
                   jsx(AccountRow, { row, t, onSwitch, busy }),
-                  jsx(UsageBars, { usage: usageRows.get(row.label), t })
+                  jsx(UsageBars, { usage: usageRows.get(row.id ?? row.label), t })
                 ]
               }))
           }),
@@ -321,7 +335,7 @@ function Panel({ status, t }) {
             jsx('span', { className: 'text-(--ui-text-tertiary)', children: `${t('revive')} ${row.label}` }),
             jsx(CommandLine, { text: row.relogin_hint })
           ]
-        }, `dead-${row.label}`)),
+        }, `dead-${row.id ?? row.label}`)),
       status.state !== 'setup'
         ? jsxs('div', {
             className: 'flex flex-col gap-1',
