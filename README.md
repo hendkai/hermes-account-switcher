@@ -14,7 +14,7 @@ This plugin adds exactly that:
 
 ## What it does
 
-- Lists every pooled account: index, label, auth type, priority, current marker, bench state (⛔ with remaining cooldown, any exhaustion class) and dead logins (✖ — refresh token rejected, log in anew), plus 5h / weekly / model-scoped usage for Anthropic OAuth logins.
+- Lists every pooled account: index, label, auth type, priority, current marker, bench state (⛔ with remaining cooldown, any exhaustion class) and dead logins (✖ — refresh token rejected, log in anew), plus 5h / weekly (account-level) and model-scoped (Opus / Sonnet week) usage for Anthropic OAuth logins. A benched row Hermes stored without a reset time shows "cooldown unknown": the plugin does not guess a duration.
 - Switching = moving the target account to **priority 0** (the same `move_entry` call `hermes auth priority` makes; that CLI is the fallback when the pool module is not importable). Everything else is renumbered by Hermes. On the next model call, that account is tried first.
 - **Refuses unsafe switches**: dead logins (Hermes never uses them again) and `env:`-fed API-key entries (reordering does not change the env var). Warns when the target is still benched, and when the provider's pool strategy is not `fill_first` (priority then barely matters).
 - **Plan mode** (`plan` / `dry_run`) previews the change before touching anything.
@@ -24,7 +24,7 @@ This plugin adds exactly that:
 
 - **Agent-initiated switches require human approval.** Reordering the pool changes which account gets billed first, so the plugin registers a `pre_tool_call` hook that escalates every model-issued `switch` and `auto` (not `list`/`plan`/`dry_run`) to Hermes' approval gate. `/switch` and the CLI are unaffected — they are already user actions.
 - **Tokens are never printed, logged, returned, or written by the plugin.**
-- **Usage percentages** (`/switch list`, the chip's usage bars, `auto`) go through Hermes' public `agent.account_usage.fetch_account_usage(read_only=True)`: each usable pooled OAuth token is sent to the provider's own API (`api.anthropic.com`) by that helper. Dead and still-benched logins are skipped; nothing is refreshed, rotated or written.
+- **Usage percentages** (`/switch list`, the chip's usage bars, `auto`) go through Hermes' public `agent.account_usage.fetch_account_usage(read_only=True)`: each usable pooled OAuth token is sent to the provider's own API (`api.anthropic.com`) by that helper. Dead logins are skipped (benched ones are read so their bars show why); nothing is refreshed, rotated or written. The plugin sends no message request of its own and writes no cooldown or bench state.
 - **`auth.json`:** the plugin never reads or writes it itself. Switching and auto rotation re-order priorities through the pool object (`move_entry`, the call behind `hermes auth priority`); everything else is read-only. Auto rotation does not bench logins: Hermes' own pool handles 429s.
 
 ## Install
@@ -131,7 +131,11 @@ plugins:
     auto_rotate: true
 ```
 
-Once enabled, while Hermes is in use, a `pre_llm_call` hook starts a background run at most every 10 minutes (shared across the gateway, CLI and desktop app through a small state file, `credential-pool-switcher-state.json` in the Hermes home: timestamps and the last result, no credentials). A run reads each login's usage (5h, weekly, model-scoped) and moves the one with the most weekly headroom to priority 0. It keeps the current login unless the winner is at least 5 points better, so two similar logins do not swap back and forth. Logins at 100% in any window, benched by Hermes, dead, or without usage data are left alone.
+Once enabled, while Hermes is in use, a `pre_llm_call` hook starts a background run at most every 10 minutes (shared across the gateway, CLI and desktop app through a small state file, `credential-pool-switcher-state.json` in the Hermes home: timestamps and the last result, no credentials). A run reads each login's usage and ranks by the **account-level** windows only (weekly first, then 5h), moving the best one to priority 0. It keeps the current login unless the winner is at least 5 points better, so two similar logins do not swap back and forth.
+
+- **Account quota vs. model cap:** a login with its 5h or weekly window at 100% is exhausted. A model-family cap (Opus / Sonnet week) is shown as a scope-specific warning and does **not** disqualify the login, because the ranking is model-agnostic.
+- **Usage-eligible is not message-verified:** "has headroom" means the usage API shows room in the account-level windows. The plugin sends no message request and writes no cooldown, so a login can still be rejected by the provider; Hermes' own pool handles that.
+- **Left alone, never promoted:** logins benched by Hermes (explicit reset time), exhausted rows with no stored reset ("cooldown unknown"; no replacement timeout is invented), dead logins, logins without usage data, and logins whose snapshot has only model-scoped windows (account headroom unproven).
 
 - Turn it off again: remove the setting or set `auto_rotate: false` (the default).
 - Run it by hand: `/switch auto [--dry-run]`, `hermes credential-pool-switcher auto`, or **Auto-rotate now** in the chip popover.

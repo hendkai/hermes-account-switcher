@@ -101,6 +101,37 @@ def test_accounts_from_pool_marks_dead_and_benched(mod):
     assert by["ok@x"].source == "hermes_pkce"
 
 
+def test_exhausted_row_without_reset_has_unknown_cooldown_not_a_fabricated_hour(mod):
+    now = time.time()
+    e = SimpleNamespace(
+        id="id9", label="noreset@x", auth_type="oauth", priority=0, source="manual:hermes_pkce",
+        last_status="exhausted", last_status_at=now - 10, last_error_code=429,
+        last_error_reset_at=None, failure_reason=None,
+    )
+    old = SimpleNamespace(**{**e.__dict__, "id": "id8", "label": "old@x", "last_status_at": now - 7200})
+    pool = SimpleNamespace(entries=lambda: [e, old], peek=lambda: None)
+    by = {a.label: a for a in mod._accounts_from_pool(pool)}
+    for a in by.values():
+        assert a.bench_until is None and a.bench_unknown is True
+        assert a.notes == ["(cooldown unknown)"] and mod._is_benched(a, now) is True
+    assert mod._bench_until(e) is None
+
+
+def test_status_shows_unknown_cooldown_without_left_time(mod, monkeypatch):
+    accounts = [_acct(mod, 0, "u@x", status="exhausted", bench_unknown=True, notes=["(cooldown unknown)"]),
+                _acct(mod, 1, "ok@x")]
+    monkeypatch.setattr(mod, "_read_accounts", lambda p: (p, accounts))
+    monkeypatch.setattr(mod, "_pool_strategy", lambda p: "fill_first")
+    rows = {r["label"]: r for r in mod.pool_status()["accounts"]}
+    assert rows["u@x"]["status"] == "benched" and rows["u@x"]["cooldown_unknown"] is True
+    assert rows["u@x"]["bench_left"] is None and rows["u@x"]["bench_until"] is None
+    assert rows["ok@x"]["cooldown_unknown"] is False
+    text = mod.render_list({
+        "provider": "anthropic", "accounts": [{"index": 1, "label": "u@x", "priority": 0, "current": False,
+                                              "status": "exhausted", "benched": "(cooldown unknown)"}]})
+    assert "cooldown unknown" in text and "1h" not in text
+
+
 # -- switching ---------------------------------------------------------------------
 
 def _acct(mod, i, label, **kw):
@@ -168,7 +199,7 @@ def test_usage_uses_public_helper_and_skips_dead(mod, monkeypatch):
     # read_only; dead logins are skipped, benched ones are read so their bars show why
     assert sorted(c[1] for c in calls) == ["tok-bench@x", "tok-ok@x"] and all(c[2] for c in calls)
     assert out["ok@x"] == {"five_hour": {"used_percent": 12.0}, "week": {"used_percent": 0.0},
-                           "scoped": {"used_percent": 100.0, "active": True}}
+                           "scoped": {"label": "Fable weekly", "used_percent": 100.0, "active": True}}
     assert "dead@x" not in out
 
 
@@ -176,6 +207,17 @@ def test_catalog_build_has_no_auth_store_or_refresh_paths(mod):
     src = PLUGIN_FILE.read_text()
     for forbidden in ("write_credential_pool", "read_credential_pool", "_auth_store_lock",
                       "_refresh_entry", "_get_json", "oauth/usage", "_write_auto_status"):
+        assert forbidden not in src, forbidden
+
+
+def test_catalog_build_sends_no_message_probe_and_writes_no_cooldown(mod):
+    """No /v1/messages request, no direct HTTP client, no cooldown/bench/auth-store write."""
+    src = PLUGIN_FILE.read_text()
+    for forbidden in ("v1/messages", "urllib", "requests.", "httpx", "http.client", "aiohttp",
+                      "mark_exhausted", "mark_used", "_mark_", "last_error_reset_at =",
+                      "last_status =", "last_status_at =", "auth.json\"", "auth_store",
+                      "_exhausted_until", "_exhausted_ttl", "_available_entries",
+                      "refresh_token", "_EXHAUSTED_FALLBACK_SECONDS"):
         assert forbidden not in src, forbidden
 
 
@@ -323,15 +365,73 @@ def test_auto_skips_exhausted_and_dry_run_moves_nothing(mod, monkeypatch):
     assert report["would_promote"] == "spare@x" and report["promoted"] is None
 
 
-def test_auto_treats_active_scoped_limit_as_exhausted(mod, monkeypatch):
-    accounts = [_acct(mod, 0, "scoped@x"), _acct(mod, 1, "ok@x")]
+def _run_auto(mod, monkeypatch, accounts, usage, dry_run=True):
     monkeypatch.setattr(mod, "_read_accounts", lambda p: (p, accounts))
-    monkeypatch.setattr(mod, "_usage_for_accounts", lambda accs, p: {
-        "scoped@x": _usage(week=10, scoped=(100.0, True)), "ok@x": _usage(week=50)})
-    monkeypatch.setattr(mod, "switch", lambda target, provider="anthropic", dry_run=False: {"ok": True})
+    monkeypatch.setattr(mod, "_usage_for_accounts", lambda accs, p: usage)
+    promoted = []
+    monkeypatch.setattr(mod, "switch", lambda target, provider="anthropic", dry_run=False:
+                        promoted.append(target) or {"ok": True})
     monkeypatch.setattr(mod, "list_accounts", lambda p="anthropic", with_usage=True: {"accounts": []})
-    report = mod.auto_rotate()
-    assert report["exhausted"] == ["scoped@x"] and report["promoted"] == "ok@x"
+    return mod.auto_rotate(dry_run=dry_run), promoted
+
+
+def test_auto_model_cap_with_account_headroom_stays_eligible(mod, monkeypatch):
+    accounts = [_acct(mod, 0, "capped@x"), _acct(mod, 1, "ok@x")]
+    usage = {"capped@x": _usage(week=10, scoped=(100.0, True)), "ok@x": _usage(week=50)}
+    report, promoted = _run_auto(mod, monkeypatch, accounts, usage, dry_run=False)
+    assert report["exhausted"] == [] and report["alive"] == ["capped@x", "ok@x"]
+    assert report["scoped_caps"] == {"capped@x": "model cap"}
+    assert report["promoted"] == "capped@x" and promoted == []  # already first and best (week 10 vs 50)
+    text = mod.render_auto(report)
+    assert "capped@x usage-eligible" in text and "model-scoped cap reached" in text
+    assert "exhausted" not in text and "not verified by a message" in text
+
+
+def test_auto_model_cap_does_not_block_promotion(mod, monkeypatch):
+    accounts = [_acct(mod, 0, "busy@x"), _acct(mod, 1, "capped@x")]
+    usage = {"busy@x": _usage(week=60), "capped@x": _usage(week=5, scoped=(100.0, True))}
+    report, promoted = _run_auto(mod, monkeypatch, accounts, usage, dry_run=False)
+    assert promoted == ["id1"] and report["promoted"] == "capped@x" and report["exhausted"] == []
+
+
+def test_auto_full_account_window_is_exhausted(mod, monkeypatch):
+    accounts = [_acct(mod, 0, "week@x"), _acct(mod, 1, "five@x"), _acct(mod, 2, "ok@x")]
+    usage = {"week@x": _usage(five=0, week=100), "five@x": _usage(five=100, week=1), "ok@x": _usage(week=40)}
+    report, _ = _run_auto(mod, monkeypatch, accounts, usage)
+    assert report["exhausted"] == ["week@x", "five@x"] and report["alive"] == ["ok@x"]
+    assert report["would_promote"] == "ok@x"
+    text = mod.render_auto(report)
+    assert "week@x account quota exhausted" in text and "five@x account quota exhausted" in text
+
+
+def test_auto_scoped_only_snapshot_is_unknown_and_not_promoted(mod, monkeypatch):
+    accounts = [_acct(mod, 0, "busy@x"), _acct(mod, 1, "scopedonly@x")]
+    usage = {"busy@x": _usage(week=90), "scopedonly@x": {"scoped": {"label": "Opus week", "used_percent": 3.0,
+                                                                     "active": False}}}
+    report, promoted = _run_auto(mod, monkeypatch, accounts, usage, dry_run=False)
+    assert report["unknown"] == ["scopedonly@x"] and report["unknown_reason"] == {"scopedonly@x": "scoped_only"}
+    assert report["alive"] == ["busy@x"] and promoted == [] and report["would_promote"] is None
+    assert "only model-scoped usage" in mod.render_auto(report)
+
+
+def test_auto_never_promotes_unknown_cooldown_row(mod, monkeypatch):
+    accounts = [_acct(mod, 0, "busy@x"),
+                _acct(mod, 1, "noreset@x", status="exhausted", bench_unknown=True, notes=["(cooldown unknown)"])]
+    usage = {"busy@x": _usage(week=90), "noreset@x": _usage(week=0)}  # great usage must not override it
+    report, promoted = _run_auto(mod, monkeypatch, accounts, usage, dry_run=False)
+    assert report["cooldown_unknown"] == ["noreset@x"] and report["benched"] == []
+    assert "noreset@x" not in report["alive"] and promoted == [] and report["would_promote"] is None
+    assert "cooldown unknown" in mod.render_auto(report)
+
+
+def test_auto_explicit_reset_bench_is_still_respected_and_expired_is_not(mod, monkeypatch):
+    now = time.time()
+    accounts = [_acct(mod, 0, "busy@x"), _acct(mod, 1, "bench@x", status="exhausted", bench_until=now + 600),
+                _acct(mod, 2, "expired@x", status="exhausted")]  # reset passed: no bench_until, no note
+    usage = {"busy@x": _usage(week=60), "bench@x": _usage(week=0), "expired@x": _usage(week=10)}
+    report, _ = _run_auto(mod, monkeypatch, accounts, usage)
+    assert report["benched"] == ["bench@x"] and report["cooldown_unknown"] == []
+    assert report["would_promote"] == "expired@x"
 
 
 def test_auto_already_first_is_not_moved(mod, monkeypatch):
@@ -350,7 +450,7 @@ def test_auto_without_oauth_logins_reports_no_headroom(mod, monkeypatch):
     monkeypatch.setattr(mod, "_usage_for_accounts", lambda accs, p: None)
     report = mod.auto_rotate()
     assert report["ok"] is True and report["alive"] == [] and report["promoted"] is None
-    assert "No login has headroom" in mod.render_auto(report)
+    assert "No login is usage-eligible" in mod.render_auto(report)
 
 
 def test_pool_status_usage_only_when_asked(mod, monkeypatch):

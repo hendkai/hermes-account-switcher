@@ -25,8 +25,10 @@ The switcher works on Hermes' own credential pool (`~/.hermes/auth.json`); it ne
        auto_rotate: true
    ```
 
-   It then checks real quota at most every 10 minutes while Hermes is in use and reorders the pool, which changes
-   the account that is billed first.
+   It then checks usage at most every 10 minutes while Hermes is in use and reorders the pool, which changes
+   the account that is billed first. It ranks by account-level 5h/weekly usage; a model-family cap (Opus/Sonnet)
+   is only shown as a warning. "Usage-eligible" is not verified by a message: the plugin sends no message request
+   and writes no cooldown. Rows with an unknown cooldown are never promoted.
 
 Dead logins (✖, refresh token rejected) are replaced with
 `hermes auth remove anthropic '<label>' && hermes auth add anthropic --type oauth --label '<label>'`.

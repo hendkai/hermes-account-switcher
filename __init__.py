@@ -26,7 +26,12 @@ How it touches Hermes:
   only when you opt in (``plugins.credential-pool-switcher.auto_rotate: true``
   in config.yaml; off by default): the ``pre_llm_call`` hook then starts it in
   the background at most every 10 minutes. It does
-  not bench logins: Hermes' own pool handles 429s. Besides the pool, the plugin
+  not bench logins: Hermes' own pool handles 429s. It ranks by account-level
+  windows (5h, week) only: a model-family cap (Opus/Sonnet week) is shown as a
+  warning but does not disqualify a login, and a login with only model-scoped
+  data, or exhausted without a stored reset, is never promoted. "Usage-eligible"
+  is not message-verified: the plugin sends no message request and writes no
+  cooldown. Besides the pool, the plugin
   keeps one small state file (``credential-pool-switcher-state.json`` in the
   Hermes home: timestamps and the last result, no credentials).
 
@@ -65,8 +70,10 @@ _ROW = re.compile(
 )
 # Any exhaustion class the core prints ("rate-limited", "billing", "exhausted",
 # ...) ends with a "(<remaining> left)" group while the bench is still running.
-# No reset timestamp stored: the core falls back to a per-error TTL; one hour is its 429 default.
-_EXHAUSTED_FALLBACK_SECONDS = 60 * 60
+# A pool row that is exhausted but stores no reset timestamp has a cooldown the
+# core derives from a per-error TTL; this plugin cannot know it and never guesses
+# one: such a row is "cooldown unknown" and is never promoted by auto rotation.
+COOLDOWN_UNKNOWN_NOTE = "(cooldown unknown)"
 _REST_BENCH = re.compile(r"\((?P<left>[^()]*\bleft)\)", re.I)
 
 
@@ -81,7 +88,8 @@ class Account:
     current: bool = False
     notes: List[str] = field(default_factory=list)
     status: str = "ok"                  # ok | exhausted | dead
-    bench_until: Optional[float] = None  # epoch seconds, only while still benched
+    bench_until: Optional[float] = None  # epoch seconds, only while still benched (explicit reset)
+    bench_unknown: bool = False          # exhausted, but no stored reset: end of the cooldown unknown
 
     @property
     def safe_label(self) -> str:
@@ -333,11 +341,8 @@ def _pool_strategy(provider: str) -> str:
 def _bench_until(entry) -> Optional[float]:
     if getattr(entry, "last_status", None) != STATUS_EXHAUSTED:
         return None
-    reset = _to_epoch(getattr(entry, "last_error_reset_at", None))
-    if reset is not None:
-        return reset
-    at = _to_epoch(getattr(entry, "last_status_at", None))
-    return at + _EXHAUSTED_FALLBACK_SECONDS if at else None
+    # Only an explicit stored reset counts; no replacement TTL is invented.
+    return _to_epoch(getattr(entry, "last_error_reset_at", None))
 
 
 def _accounts_from_pool(pool) -> List[Account]:
@@ -352,9 +357,13 @@ def _accounts_from_pool(pool) -> List[Account]:
         status = str(getattr(e, "last_status", "") or "ok")
         until = _bench_until(e)
         notes: List[str] = []
+        unknown = False
         if status == STATUS_DEAD:
             notes = ["dead — re-login needed"]
             until = None
+        elif status == STATUS_EXHAUSTED and until is None:
+            unknown = True
+            notes = [COOLDOWN_UNKNOWN_NOTE]
         elif until is not None and until > now:
             notes = [f"({_fmt_left(until - now)} left)"]
         else:
@@ -370,6 +379,7 @@ def _accounts_from_pool(pool) -> List[Account]:
             notes=notes,
             status=status if status in (STATUS_EXHAUSTED, STATUS_DEAD) else "ok",
             bench_until=until,
+            bench_unknown=unknown,
         ))
     return out
 
@@ -394,6 +404,8 @@ def _usage_for_accounts(accounts: List[Account], provider: str = DEFAULT_PROVIDE
     refreshes, rotates or benches a pool entry. Dead logins are skipped (their
     token is useless); benched ones are still read, so their bars show why.
     An expired idle login simply shows no percentages.
+    ``five_hour`` / ``week`` are account-level windows; ``scoped`` is the tightest
+    model-family cap and is informational for model-agnostic decisions.
     Returns ``{label: {"five_hour": ..., "week": ..., "scoped": {...}}}`` or None.
     """
     wanted = {a.label for a in accounts
@@ -426,9 +438,12 @@ def _usage_for_accounts(accounts: List[Account], provider: str = DEFAULT_PROVIDE
             name = str(w.label or "").lower()
             pct = w.used_percent
             if getattr(w, "scope", "account") == "model":
+                # Model-family caps (Opus / Sonnet week) are scope-specific: shown,
+                # never mixed into the account-level five_hour / week windows.
                 prev = (windows.get("scoped") or {}).get("used_percent")
                 if prev is None or (pct is not None and pct > prev):  # keep the tightest model cap
-                    windows["scoped"] = {"used_percent": pct, "active": bool(pct is not None and pct >= 100)}
+                    windows["scoped"] = {"label": str(w.label or "model cap"), "used_percent": pct,
+                                         "active": bool(pct is not None and pct >= 100)}
             elif "session" in name:
                 windows["five_hour"] = {"used_percent": pct}
             elif "week" in name:
@@ -552,6 +567,8 @@ def _is_benched(account: Account, now: float) -> bool:
         return False
     if account.bench_until is not None:
         return account.bench_until > now
+    if account.bench_unknown:
+        return True  # cooldown not knowable: treat as unavailable, never as expired
     return bool(account.notes)  # CLI fallback: only "(… left)" is known
 
 
@@ -593,7 +610,9 @@ def pool_status(provider: str = DEFAULT_PROVIDER, with_usage: bool = False) -> d
             "status": status,
             "active": active is not None and a.id == active.id,
             "bench_until": _iso_utc(a.bench_until) if a.bench_until else None,
-            "bench_left": (a.notes[0].strip("()").removesuffix(" left") if status == "benched" and a.notes else None),
+            "bench_left": (a.notes[0].strip("()").removesuffix(" left")
+                           if status == "benched" and a.notes and not a.bench_unknown else None),
+            "cooldown_unknown": bool(status == "benched" and a.bench_unknown),
             # Only a usable account that is not already next: switching onto a
             # benched one changes nothing until its reset.
             "switchable": (status == "ok" and _switch_blocker(a, provider) is None
@@ -700,6 +719,11 @@ def switch(
             f"{account.safe_label} is benched until {_iso_utc(account.bench_until)}; "
             "Hermes skips it until then even at priority 0."
         )
+    elif account.bench_unknown:
+        plan["warning"] = (
+            f"{account.safe_label} is benched by Hermes (exhausted) and no reset time is stored, "
+            "so its cooldown is unknown; Hermes skips it until the cooldown ends."
+        )
     note = _strategy_note(provider, strategy)
     if note:
         plan["strategy_note"] = note
@@ -723,12 +747,22 @@ def switch(
 # -- usage-based auto rotation (read-only) -----------------------------------------
 
 def _exhausted(info: dict) -> bool:
-    """A login is out when its 5h or week window is at 100% or a model-scoped limit is active."""
+    """Account quota is out when its 5h or week (account-level) window is at 100%.
+
+    A model-family cap (``scoped``) is deliberately not considered: it limits
+    one model family, not the account, and auto ranking is model-agnostic.
+    """
     for key in ("five_hour", "week"):
         pct = (info.get(key) or {}).get("used_percent")
         if isinstance(pct, (int, float)) and pct >= 100:
             return True
-    return bool((info.get("scoped") or {}).get("active"))
+    return False
+
+
+def _has_account_window(info: dict) -> bool:
+    """True when the snapshot carries at least one account-level percentage."""
+    return any(isinstance((info.get(k) or {}).get("used_percent"), (int, float))
+               for k in ("five_hour", "week"))
 
 
 def _window_pct(info: dict, key: str) -> float:
@@ -739,8 +773,12 @@ def auto_rotate(provider: str = DEFAULT_PROVIDER, *, dry_run: bool = False) -> d
     """Usage-based rotation: move the login with the most headroom to priority 0.
 
     Reads usage through the public helper and reorders with :func:`switch`
-    (the pool's ``move_entry``). It never benches, refreshes or writes tokens:
-    a login Hermes' own pool benched after a 429 is only skipped here.
+    (the pool's ``move_entry``). It never benches, refreshes or writes tokens,
+    and sends no message request: a login Hermes' own pool benched after a 429
+    is only skipped here. Ranking uses account-level windows only (5h, week); a
+    model-family cap is reported (``scoped_caps``) but does not exclude a login.
+    "Has headroom" means usage-eligible, not verified by a message. Logins with
+    scoped-only usage data, or exhausted without a stored reset, are never promoted.
     """
     if provider != DEFAULT_PROVIDER:
         return {"ok": False, "error": f"auto rotation supports 'anthropic' (got '{provider}')."}
@@ -752,7 +790,8 @@ def auto_rotate(provider: str = DEFAULT_PROVIDER, *, dry_run: bool = False) -> d
     now = time.time()
     report: dict = {
         "ok": True, "dry_run": dry_run, "provider": provider,
-        "alive": [], "exhausted": [], "benched": [], "dead": [], "unknown": [], "relogin": {},
+        "alive": [], "exhausted": [], "benched": [], "cooldown_unknown": [], "dead": [],
+        "unknown": [], "unknown_reason": {}, "scoped_caps": {}, "relogin": {},
         "promoted": None, "would_promote": None, "order_after": None,
     }
     candidates: List[Account] = []
@@ -762,15 +801,25 @@ def auto_rotate(provider: str = DEFAULT_PROVIDER, *, dry_run: bool = False) -> d
         if a.status == STATUS_DEAD:
             report["dead"].append(a.label)
             report["relogin"][a.label] = _relogin_hint(provider, a.label, a.source)
+        elif a.bench_unknown:
+            report["cooldown_unknown"].append(a.label)  # exhausted, no stored reset: never promoted
         elif _is_benched(a, now):
             report["benched"].append(a.label)
         elif a.label not in usage:
             report["unknown"].append(a.label)
+            report["unknown_reason"][a.label] = "no_usage"
         elif _exhausted(usage[a.label]):
             report["exhausted"].append(a.label)
+        elif not _has_account_window(usage[a.label]):
+            # scoped-only (or empty) snapshot: no proof of account headroom
+            report["unknown"].append(a.label)
+            report["unknown_reason"][a.label] = "scoped_only"
         else:
             report["alive"].append(a.label)
             candidates.append(a)
+        scoped = (usage.get(a.label) or {}).get("scoped")
+        if scoped and scoped.get("active") and a.status != STATUS_DEAD:
+            report["scoped_caps"][a.label] = scoped.get("label") or "model cap"
 
     if candidates:
         def _rank(a: Account):
@@ -960,8 +1009,9 @@ def render_list(data: dict, markdown: bool = False) -> str:
                     parts.append(f"{short} {round(pct)}%")
             scoped = u.get("scoped") or {}
             if scoped.get("used_percent") is not None:
-                flag = "⛔" if scoped.get("active") else ""
-                parts.append(f"scoped {round(scoped['used_percent'])}%{flag}")
+                name = scoped.get("label") or "scoped"
+                flag = " ⚠ model cap reached (this model family only)" if scoped.get("active") else ""
+                parts.append(f"{name} {round(scoped['used_percent'])}%{flag}")
             usage = " · " + " ".join(parts) if parts else ""
         lines.append(
             f"{mark}#{a['index']} {a['label']} — priority {a['priority']}"
@@ -970,8 +1020,8 @@ def render_list(data: dict, markdown: bool = False) -> str:
             + (f" · benched {benched}" if benched and not dead else "")
             + usage
         )
-    lines.append("● = current entry marker · priority 0 is tried first · ⛔ = benched (exhausted)"
-                 " · ✖ = dead (log in anew)"
+    lines.append("● = current entry marker · priority 0 is tried first · ⛔ = benched (exhausted; "
+                 "\"cooldown unknown\" = Hermes stored no reset time) · ✖ = dead (log in anew)"
                  + ("" if data.get("usage_available") else " · usage % unavailable"))
     if relogin:
         lines.append("To revive dead logins:")
@@ -1012,14 +1062,26 @@ def render_auto(data: dict, markdown: bool = False) -> str:
     if not data.get("ok") and not data.get("provider"):
         return f"{b}Auto rotation failed{b}: {data.get('error')}"
     lines = [f"{b}Auto rotation ({data['provider']}){b}" + (" — dry run" if data.get("dry_run") else "")]
+    caps = data.get("scoped_caps") or {}
     for label in data["alive"]:
-        lines.append(f"✓ {label} has headroom")
+        extra = f" — ⚠ model-scoped cap reached: {caps[label]} (that model family only)" if label in caps else ""
+        lines.append(f"✓ {label} usage-eligible (5h/week below 100%; not verified by a message){extra}")
     for label in data["exhausted"]:
-        lines.append(f"⛔ {label} exhausted (5h or week at 100%)")
+        lines.append(f"⛔ {label} account quota exhausted (5h or week at 100%)")
     for label in data["benched"]:
         lines.append(f"⛔ {label} benched by Hermes until its reset")
+    for label in data.get("cooldown_unknown", []):
+        lines.append(f"? {label} exhausted, cooldown unknown (no reset stored; left untouched)")
+    reasons = data.get("unknown_reason") or {}
     for label in data["unknown"]:
-        lines.append(f"? {label} usage unavailable this round (left untouched)")
+        if reasons.get(label) == "scoped_only":
+            lines.append(f"? {label} only model-scoped usage seen, no account-level window "
+                         "(headroom unproven; left untouched)")
+        else:
+            lines.append(f"? {label} usage unavailable this round (left untouched)")
+    for label, cap in caps.items():
+        if label not in data["alive"]:
+            lines.append(f"⚠ {label}: model-scoped cap reached: {cap} (that model family only)")
     for label in data["dead"]:
         lines.append(f"✖ {label} dead — log in anew: " + data.get("relogin", {}).get(label, ""))
     if data.get("promoted"):
@@ -1029,7 +1091,7 @@ def render_auto(data: dict, markdown: bool = False) -> str:
     elif data.get("would_promote"):
         lines.append(f"Would move {data['would_promote']} to priority 0")
     elif data.get("ok") and not data["alive"]:
-        lines.append("No login has headroom right now — order unchanged.")
+        lines.append("No login is usage-eligible right now — order unchanged.")
     if data.get("error"):
         lines.append(f"⚠ {data['error']}")
     return "\n".join(lines)
