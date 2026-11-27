@@ -32,6 +32,7 @@ const {
 const ID = 'credential-pool-switcher'
 const CLI = 'credential-pool-switcher'
 const PREFIX = 'CPS_STATUS '
+const RESULT_PREFIX = 'CPS_RESULT '
 const QK = [ID, 'status']
 const UQK = [ID, 'usage']
 const POLL_MS = 90_000
@@ -44,7 +45,7 @@ const MESSAGES = {
     setupIntro: 'No accounts yet. The switcher works on Hermes\u2019 credential pool (~/.hermes/auth.json).',
     step1: 'Add each Claude account once \u2014 opens the browser login:',
     step2: 'Repeat for every account, then come back here: the indicator switches to the account in use.',
-    step3: 'Nothing else to do: accounts are listed with their 5 h and weekly bars, and the switcher moves to the one with the most headroom by itself.',
+    step3: 'Automatic switching is off by default. Switch by clicking an account, or turn it on: plugins.credential-pool-switcher.auto_rotate: true',
     allExhausted: 'Claude: all exhausted',
     readyAt: (t) => `next ready ${t}`,
     inUse: 'in use',
@@ -67,6 +68,7 @@ const MESSAGES = {
     usageUnavailable: 'Usage unavailable right now',
     switched: (label) => `Claude account switched: ${label} is used first`,
     switchFailed: (msg) => `Switch failed: ${msg}`,
+    switchUnverified: (label) => `${label} was moved, but the switcher could not confirm it is used first — check the list.`,
     autoDone: 'Auto rotation finished',
     autoFailed: (msg) => `Auto rotation failed: ${msg}`,
     autoOn: (mins, last) => `Auto-switch on \u00b7 every ${mins} min` + (last ? ` \u00b7 last check ${last}` : ''),
@@ -80,7 +82,7 @@ const MESSAGES = {
     setupIntro: 'Noch keine Accounts hinterlegt. Der Switcher nutzt den Credential-Pool von Hermes (~/.hermes/auth.json).',
     step1: 'Jeden Claude-Account einmal hinzuf\u00fcgen \u2014 \u00f6ffnet den Browser-Login:',
     step2: 'F\u00fcr jeden Account wiederholen. Danach zeigt der Indikator hier den aktiven Account.',
-    step3: 'Mehr ist nicht n\u00f6tig: Accounts erscheinen mit 5-Std.- und Wochen-Balken, und der Switcher wechselt selbst zum Account mit dem meisten Spielraum.',
+    step3: 'Automatisches Wechseln ist standardm\u00e4\u00dfig aus. Account anklicken zum Wechseln, oder einschalten: plugins.credential-pool-switcher.auto_rotate: true',
     allExhausted: 'Claude: alle ersch\u00f6pft',
     readyAt: (t) => `wieder frei ${t}`,
     inUse: 'aktiv',
@@ -103,6 +105,7 @@ const MESSAGES = {
     usageUnavailable: 'Nutzung gerade nicht verf\u00fcgbar',
     switched: (label) => `Claude-Account gewechselt: ${label} wird zuerst genutzt`,
     switchFailed: (msg) => `Wechsel fehlgeschlagen: ${msg}`,
+    switchUnverified: (label) => `${label} wurde verschoben, aber der Switcher konnte nicht best\u00e4tigen, dass er zuerst genutzt wird — Liste pr\u00fcfen.`,
     autoDone: 'Auto-Rotation fertig',
     autoFailed: (msg) => `Auto-Rotation fehlgeschlagen: ${msg}`,
     autoOn: (mins, last) => `Auto-Switch an \u00b7 alle ${mins} Min.` + (last ? ` \u00b7 zuletzt gepr\u00fcft ${last}` : ''),
@@ -110,6 +113,33 @@ const MESSAGES = {
     loadFailed: 'Account-Switcher nicht erreichbar',
     retry: 'Klick = erneut versuchen'
   }
+}
+
+// ── CLI result contract ───────────────────────────────────────────────────────
+// `switch` / `plan` / `auto` end with a `CPS_RESULT <outcome>` line and exit nonzero
+// when the outcome is not ok. Success is decided ONLY by that pair, never by a
+// zero exit or the absence of a 'failed' word: a pool-read error, a refused switch
+// and an unverified move all report failure here.
+function cliOutcome(code, output) {
+  if (code !== 0) return { ok: false, kind: 'failed', message: output.trim().split('\n').filter((l) => !l.startsWith(RESULT_PREFIX)).pop() || `exit ${code}` }
+  const outcome = output.split('\n').map((l) => l.trim()).filter((l) => l.startsWith(RESULT_PREFIX)).pop()
+  if (!outcome) return { ok: false, kind: 'failed', message: 'no result line from the switcher CLI' }
+  const kind = outcome.slice(RESULT_PREFIX.length).trim()
+  if (kind === 'ok') return { ok: true, kind }
+  return { ok: false, kind, message: output.trim().split('\n').filter((l) => !l.startsWith(RESULT_PREFIX) && !l.startsWith(PREFIX)).join(' ') || kind }
+}
+
+// A row click must carry the credential's entry id: pass it as an exact id (no label /
+// #n / prefix matching), so a row whose label equals another row's id cannot be switched.
+// Without an id the row is not switchable at all: typed commands may use friendly
+// label matching, row clicks may not.
+function rowSwitchArgv(row) {
+  return row && row.id ? ['switch', '--exact-id', row.id] : null
+}
+
+// A move that ran but could not be confirmed deserves its own wording, not "failed".
+function switchFailText(row, message, t) {
+  return /unverified/i.test(String(message)) ? t('switchUnverified', row.label) : t('switchFailed', message)
 }
 
 // ── data ──────────────────────────────────────────────────────────────────────
@@ -238,7 +268,9 @@ function SetupSteps({ status, t }) {
 }
 
 function AccountRow({ row, t, onSwitch, busy }) {
-  const clickable = row.switchable && !busy
+  // No entry id (old backend row) → no switch: an id-less click could only fall back to
+  // label matching, which can hit the wrong account when labels repeat.
+  const clickable = row.switchable && !!row.id && !busy
   return jsxs('button', {
     type: 'button',
     disabled: !clickable,
@@ -272,7 +304,8 @@ function Panel({ status, t }) {
     setBusy(true)
     try {
       const { code, output } = await runCli(argv, argv[0] === 'auto' ? 180 : 60)
-      if (code !== 0 || /failed/i.test(output)) throw new Error(output.trim().split('\n').pop() || `exit ${code}`)
+      const outcome = cliOutcome(code, output)
+      if (!outcome.ok) throw new Error(outcome.message)
       host.notify({ kind: 'success', message: okMsg })
     } catch (err) {
       host.notify({ kind: 'error', message: failMsg(err?.message || String(err)) })
@@ -282,9 +315,12 @@ function Panel({ status, t }) {
     }
   }
 
-  // A row click carries the credential's entry id: pass it as an exact id (no label / #n / prefix
-  // matching), so a row whose label happens to equal another row's id cannot be switched instead.
-  const onSwitch = (row) => act(row.id ? ['switch', '--exact-id', row.id] : ['switch', row.label], t('switched', row.label), (m) => t('switchFailed', m))
+  // A row click switches by exact entry id only (see rowSwitchArgv); a row without an
+  // id is never switchable — there is no friendly-label fallback for clicks.
+  const onSwitch = (row) => {
+    const argv = rowSwitchArgv(row)
+    if (argv) act(argv, t('switched', row.label), (m) => switchFailText(row, m, t))
+  }
   const dead = status.accounts.filter((r) => r.status === 'dead')
 
   return jsxs('div', {

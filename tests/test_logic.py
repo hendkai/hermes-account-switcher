@@ -62,22 +62,7 @@ def _iso(epoch: float) -> str:
     return datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc).isoformat()
 
 
-# -- parsing ---------------------------------------------------------------------
-
-def test_parse_list_handles_spaced_labels_and_any_bench_class(mod):
-    text = "\n".join([
-        "anthropic (3 credentials):",
-        "  #1  my work acct         oauth   id=aaa111 priority=0 hermes_pkce ←",
-        "  #2  b@example.com        oauth   id=bbb222 priority=1 hermes_pkce billing (402) (1h 5m left)",
-        "  #3  ANTHROPIC_API_KEY    api_key id=ccc333 priority=2 env:ANTHROPIC_API_KEY",
-    ])
-    provider, accounts = mod._parse_list(text)
-    assert provider == "anthropic"
-    assert [a.label for a in accounts] == ["my work acct", "b@example.com", "ANTHROPIC_API_KEY"]
-    assert accounts[0].current and accounts[0].auth_type == "oauth"
-    assert accounts[1].notes == ["(1h 5m left)"] and accounts[1].status == "exhausted"
-    assert accounts[2].source == "env:ANTHROPIC_API_KEY" and not accounts[2].notes
-
+# -- pool rows ---------------------------------------------------------------------
 
 def test_accounts_from_pool_marks_dead_and_benched(mod):
     now = time.time()
@@ -191,7 +176,7 @@ def test_usage_uses_public_helper_and_skips_dead(mod, monkeypatch):
                                         W("Fable weekly", 100.0, "model")])
 
     _fake_module(monkeypatch, "agent.account_usage", fetch_account_usage=fake_fetch)
-    entries = [SimpleNamespace(id=f"id{i}", label=l, auth_type="oauth", access_token=f"tok-{l}")
+    entries = [SimpleNamespace(id=f"id{i}", label=l, auth_type="oauth", source="manual:x", access_token=f"tok-{l}")
                for i, l in enumerate(("ok@x", "dead@x", "bench@x"))]
     monkeypatch.setattr(mod, "_load_pool", lambda p: SimpleNamespace(entries=lambda: entries))
     accounts = [_acct(mod, 0, "ok@x"), _acct(mod, 1, "dead@x", status="dead"),
@@ -576,7 +561,7 @@ def test_usage_includes_benched_logins_but_not_dead(mod, monkeypatch):
     accounts = [_acct(mod, 0, "ok@x"), _acct(mod, 1, "bench@x", status="exhausted", bench_until=time.time() + 600),
                 _acct(mod, 2, "dead@x", status="dead")]
     seen = []
-    entries = [SimpleNamespace(id=a.id, label=a.label, access_token="tok-" + a.label, auth_type="oauth") for a in accounts]
+    entries = [SimpleNamespace(id=a.id, label=a.label, access_token="tok-" + a.label, auth_type="oauth", source="manual:x") for a in accounts]
     monkeypatch.setattr(mod, "_load_pool", lambda p: SimpleNamespace(entries=lambda: entries))
     win = lambda label, pct, scope="account": SimpleNamespace(label=label, used_percent=pct, scope=scope)
     fake = types.ModuleType("agent.account_usage")
@@ -666,8 +651,8 @@ def test_auto_moves_winner_that_is_still_eligible_on_the_fresh_read(mod, monkeyp
 
 
 def _dup_entries():
-    return [SimpleNamespace(id="idA", label="same@x", auth_type="oauth", access_token="tok-A"),
-            SimpleNamespace(id="idB", label="same@x", auth_type="oauth", access_token="tok-B")]
+    return [SimpleNamespace(id="idA", label="same@x", auth_type="oauth", source="manual:x", access_token="tok-A"),
+            SimpleNamespace(id="idB", label="same@x", auth_type="oauth", source="manual:x", access_token="tok-B")]
 
 
 def test_duplicate_labels_keep_separate_usage_and_pass_identity_id(mod, monkeypatch):
@@ -768,10 +753,9 @@ def test_render_keeps_model_family_label_and_unknown_cooldown(mod):
 
 # -- review follow-up 2: fail-closed eligibility, exact entry ids ---------------------
 
-def test_cli_text_rows_are_marked_unverified(mod):
-    _, rows = mod._parse_list(
-        "anthropic (1 credentials):\n#1  a@x  oauth  id=ida  priority=0  hermes_pkce\n")
-    assert rows and all(r.authoritative is False for r in rows)
+def test_there_is_no_cli_text_parser_left(mod):
+    # `hermes auth list` is never a read path (it loads and peeks the pool); only the snapshot is.
+    assert not hasattr(mod, "_parse_list")
     assert _acct(mod, 0, "a@x").authoritative is True
 
 
@@ -816,11 +800,6 @@ def test_auto_never_ranks_cli_text_rows(mod, monkeypatch):
     assert "not read directly from the pool" in mod.render_auto(report)
 
 
-def test_cooldown_state_is_not_invented_for_unverified_rows(mod):
-    _, rows = mod._parse_list("anthropic (1 credentials):\n#1  a@x  oauth  id=ida  priority=0  hermes_pkce\n")
-    assert rows[0].bench_until is None and rows[0].bench_unknown is False and rows[0].notes == []
-
-
 def _three(mod):
     return [_acct(mod, 0, "busy@x"), _acct(mod, 1, "fresh@x"), _acct(mod, 2, "other@x")]
 
@@ -859,9 +838,10 @@ def test_exact_id_duplicate_ids_fail_closed(mod):
     assert mod._find_exact_id([a, b], "dup")[0] is None
 
 
-def _pool_entry(i, label, *, status=None, reset=None, token="", eid=None, source="manual:hermes_pkce"):
+def _pool_entry(i, label, *, status=None, reset=None, token="", eid=None, source="manual:hermes_pkce",
+                auth_type="oauth"):
     return SimpleNamespace(
-        id=eid or f"id{i}", label=label, auth_type="oauth", priority=i, source=source,
+        id=eid or f"id{i}", label=label, auth_type=auth_type, priority=i, source=source,
         last_status=status, last_status_at=time.time() if status else None, last_error_code=None,
         last_error_reset_at=reset, failure_reason=None, access_token=token)
 
@@ -1033,11 +1013,27 @@ def test_unreadable_pool_fails_closed_without_cli_fallback_or_load_pool(mod, mon
     assert moved == []  # no write path was even opened
 
 
-def test_missing_read_accessor_falls_back_to_display_only_text(mod, monkeypatch):
+def test_missing_read_accessor_fails_closed_on_every_read_path(mod, monkeypatch, capsys):
+    """Older core without read_credential_pool: no `hermes auth list` fallback, no load_pool."""
     monkeypatch.setitem(sys.modules, "hermes_cli.auth", types.ModuleType("hermes_cli.auth"))  # no read accessor
-    monkeypatch.setattr(mod, "_run", lambda args: "anthropic (1 credentials):\n  #1  a@x oauth id=idA priority=0 hermes_pkce ←")
-    _, accounts = mod._read_accounts("anthropic")
-    assert accounts[0].authoritative is False
+    _fake_module(monkeypatch, "agent.credential_pool", PooledCredential=SimpleNamespace,
+                 load_pool=lambda p: pytest.fail("load_pool must not be a read fallback"),
+                 get_pool_strategy=lambda p: "fill_first")
+    monkeypatch.setattr(mod, "_run", lambda *a, **k: pytest.fail("no CLI fallback (auth list loads and peeks the pool)"))
+    for fn in (mod._read_accounts, mod.list_accounts, mod.pool_status, mod.auto_rotate,
+               lambda p: mod.switch("a", p, dry_run=True), lambda p: mod.switch("a", p, dry_run=True, exact_id=True)):
+        with pytest.raises(mod.PoolReadError, match="read-only"):
+            fn("anthropic")
+    # tool / slash / CLI report it and change nothing; the CLI exits nonzero
+    assert json.loads(mod._tool_account_switch({"action": "list"}))["ok"] is False
+    assert json.loads(mod._tool_account_switch({"action": "plan", "target": "a"}))["ok"] is False
+    assert "nothing was changed" in mod._slash("list")
+    for cmd in ("list", "status", "setup", "plan", "switch", "auto"):
+        with pytest.raises(SystemExit) as ei:
+            mod._handle_cli(SimpleNamespace(cmd=cmd, target="a", provider="anthropic", dry_run=True, exact_id=False))
+        assert ei.value.code == 1
+    out = capsys.readouterr().out
+    assert "nothing was changed" in out and "failed" in out
 
 
 def _functions_calling(tree, predicate):
@@ -1058,6 +1054,9 @@ def test_source_calls_load_pool_and_peek_only_where_a_write_is_allowed(mod):
                                                          "lift_reopened_cooldowns", "next_available_at"}) == set()
     assert _functions_calling(tree, lambda f: name(f) == "_load_writable_pool") == {"_move_to_front"}
     assert _functions_calling(tree, lambda f: name(f) == "move_entry") == {"_move_to_front"}
+    # `hermes auth list` is never invoked anywhere: it loads and peeks the pool and can persist.
+    assert '"auth", "list"' not in PLUGIN_FILE.read_text()
+    assert not hasattr(mod, "_parse_list")
 
 
 # -- same-pool revalidation of the exact id right before the move ---------------------------
@@ -1159,9 +1158,11 @@ def test_desktop_row_click_never_switches_the_label_twin(mod, monkeypatch, capsy
     monkeypatch.setattr(mod, "_pool_strategy", lambda p: "fill_first")
     monkeypatch.setattr(mod, "_move_to_front", lambda *a, **k: pytest.fail("ambiguous exact id must not move anything"))
     args = SimpleNamespace(cmd="switch", target="id1", provider="anthropic", dry_run=False, exact_id=True)
-    mod._handle_cli(args)
+    with pytest.raises(SystemExit) as ei:
+        mod._handle_cli(args)
     out = capsys.readouterr().out
-    assert "Switch failed" in out and "collides" in out
+    assert ei.value.code == 1 and "Switch failed" in out and "collides" in out
+    assert out.strip().splitlines()[-1] == "CPS_RESULT failed"
 
 
 def test_desktop_row_click_moves_exactly_the_clicked_entry(mod, monkeypatch, capsys):
@@ -1185,4 +1186,232 @@ def test_cli_parser_accepts_exact_id_and_the_desktop_passes_it(mod):
     assert ns.exact_id is True and ns.target == "id1"
     assert p.parse_args(["switch", "id1"]).exact_id is False
     js = PLUGIN_JS.read_text()
-    assert "'switch', '--exact-id', row.id" in js  # row clicks carry the entry id as an exact id
+    assert "rowSwitchArgv" in js and "['switch', '--exact-id', row.id]" in js  # row clicks: exact id, one helper
+
+
+# -- Astra round 3, second batch: fail-closed reads, oauth revalidation, safe usage tokens, outcome reporting ------------------
+
+
+def _snap(entries):
+    return SimpleNamespace(entries=lambda: list(entries))
+
+
+def test_usage_token_entries_filters_on_the_second_snapshot(mod):
+    now = time.time()
+    token_rows = [
+        SimpleNamespace(id="idA", label="a@x", auth_type="oauth", source="manual:x",
+                        last_status=None, access_token="tok-A"),
+        # legacy borrowed row that still carries a token: never probed
+        SimpleNamespace(id="idB", label="cc@x", auth_type="oauth", source="claude_code",
+                        last_status=None, access_token="tok-B"),
+        # turned into an API key since the first snapshot
+        SimpleNamespace(id="idC", label="c@x", auth_type="api_key", source="manual:x",
+                        last_status=None, access_token="tok-C"),
+        # died between the snapshots
+        SimpleNamespace(id="idD", label="d@x", auth_type="oauth", source="manual:x",
+                        last_status="dead", access_token="tok-D"),
+        # source is gone entirely: not provably pool-owned
+        SimpleNamespace(id="idE", label="e@x", auth_type="oauth", source="",
+                        last_status=None, access_token="tok-E"),
+        # Hermes' own root-file login (hermes auth login): an explicit Hermes flow
+        SimpleNamespace(id="idF", label="f@x", auth_type="oauth", source="hermes_pkce",
+                        last_status=None, access_token="tok-F"),
+    ]
+    got = mod._usage_token_entries(token_rows, {"idA", "idB", "idC", "idD", "idE", "idF"})
+    assert got == [("idA", "tok-A"), ("idF", "tok-F")]
+    # a duplicated id keeps BOTH tokens at home (ambiguous which entry owns the token)
+    dup = token_rows + [SimpleNamespace(id="idA", label="a2@x", auth_type="oauth", source="manual:x",
+                                        last_status=None, access_token="tok-A2")]
+    assert mod._usage_token_entries(dup, {"idA"}) == []
+    # nothing wanted -> nothing probed
+    assert mod._usage_token_entries(token_rows, set()) == []
+
+
+def test_usage_fetch_rechecks_the_actual_second_snapshot_entry(mod, monkeypatch):
+    """State/source changed between the first read (accounts) and the token snapshot: no probe."""
+    calls = []
+    _fake_module(monkeypatch, "agent.account_usage",
+                 fetch_account_usage=lambda provider, api_key=None, read_only=False, identity_id=None: (
+                     calls.append((api_key, identity_id)) or SimpleNamespace(windows=[
+                         SimpleNamespace(label="Current week", used_percent=10.0, scope="account")])))
+    first = [_acct(mod, 0, "a@x"), _acct(mod, 1, "b@x"), _acct(mod, 2, "cc@x", source="manual:hermes_pkce")]
+    monkeypatch.setattr(mod, "_read_accounts", lambda p: (p, first))  # first read: cc still pool-owned
+    second = [  # second snapshot: a is fine, b died, cc became a borrowed claude_code row with a token
+        SimpleNamespace(id="id0", label="a@x", auth_type="oauth", source="manual:x", last_status=None, access_token="tok-a"),
+        SimpleNamespace(id="id1", label="b@x", auth_type="oauth", source="manual:x", last_status="dead", access_token="tok-b"),
+        SimpleNamespace(id="id2", label="cc@x", auth_type="oauth", source="claude_code", last_status=None, access_token="tok-cc"),
+    ]
+    monkeypatch.setattr(mod, "_load_pool", lambda p: _snap(second))
+    out = mod._usage_for_accounts(first)
+    assert [c[0] for c in calls] == ["tok-a"] and [c[1] for c in calls] == ["id0"]
+    assert set(out) == {"id0"}  # no dead token, no borrowed token probed or exposed
+
+
+def test_legacy_borrowed_row_with_token_is_never_probed(mod, monkeypatch):
+    calls = []
+    _fake_module(monkeypatch, "agent.account_usage",
+                 fetch_account_usage=lambda provider, api_key=None, read_only=False, identity_id=None: (
+                     calls.append(api_key) or SimpleNamespace(windows=[
+                         SimpleNamespace(label="Current week", used_percent=5.0, scope="account")])))
+    rows = [{"id": "idA", "label": "a@x", "priority": 0, "access_token": "tok-a", "source": "manual:hermes_pkce"},
+            {"id": "idC", "label": "cc@x", "priority": 1, "access_token": "tok-cc", "source": "claude_code"}]
+    _snapshot_env(monkeypatch, mod, rows)
+    assert json.loads(json.dumps(mod.list_accounts()))["usage_available"] is True
+    assert calls == ["tok-a"]  # only the pool-owned token ever reaches the helper
+
+
+def test_auto_move_declines_when_the_winner_became_an_api_key(mod, monkeypatch):
+    """Ranked as OAuth on the first read; the pool used for the move now shows an api_key row."""
+    accts = [_acct(mod, 0, "busy@x"), _acct(mod, 1, "fresh@x")]
+    monkeypatch.setattr(mod, "_read_accounts", lambda p: (p, accts))
+    monkeypatch.setattr(mod, "_usage_for_accounts", lambda accs, p: _by_id(accts, {
+        "busy@x": _usage(week=90), "fresh@x": _usage(week=0)}))
+    monkeypatch.setattr(mod, "_pool_strategy", lambda p: "fill_first")
+    moved = []
+    changed = [_pool_entry(0, "busy@x"),
+               _pool_entry(1, "fresh@x", auth_type="api_key")]
+    monkeypatch.setattr(mod, "_load_writable_pool", lambda p: _writable(changed, moved))
+    out = mod._move_to_front("anthropic", _acct(mod, 1, "fresh@x"), exact_id=True, require_eligible=True)
+    assert isinstance(out, mod._MoveDeclined) and "OAuth" in out and moved == []
+
+
+def test_switch_require_eligible_declines_a_non_oauth_winner_before_moving(mod, monkeypatch):
+    rows = [_acct(mod, 0, "busy@x"), _acct(mod, 1, "key@x", auth_type="api_key")]
+    monkeypatch.setattr(mod, "_read_accounts", lambda p: (p, rows))
+    monkeypatch.setattr(mod, "_pool_strategy", lambda p: "fill_first")
+    monkeypatch.setattr(mod, "_move_to_front", lambda *a, **k: pytest.fail("a non-oauth winner must not move"))
+    out = mod.switch("id1", require_eligible=True, exact_id=True)
+    assert out["ok"] is False and out["declined"] is True and "OAuth" in out["reason"]
+    # manual switch is unchanged
+    monkeypatch.setattr(mod, "_move_to_front", lambda *a, **k: None)
+    monkeypatch.setattr(mod, "list_accounts", lambda *a, **k: {"accounts": []})
+    assert mod.switch("key@x")["ok"] is True
+
+
+# -- outcome reporting the desktop relies on -------------------------------------------
+
+
+def test_cli_outcomes_for_switch_paths(mod, monkeypatch, capsys):
+    accts = [mod.Account(index=1, label="a@x", auth_type="oauth", id="idA", priority=0, source="manual:hermes_pkce"),
+             mod.Account(index=2, label="b@x", auth_type="oauth", id="idB", priority=1, source="manual:hermes_pkce")]
+    monkeypatch.setattr(mod, "_read_accounts", lambda p: (p, accts))
+    monkeypatch.setattr(mod, "_pool_strategy", lambda p: "fill_first")
+    moved = []
+    monkeypatch.setattr(mod, "_move_to_front", lambda p, a, **k: moved.append(a.id))
+
+    def order(first_id):
+        return lambda *a, **k: {"accounts": [
+            {"label": "b@x", "id": "idB", "priority": 0}, {"label": "a@x", "id": first_id, "priority": 1}]}
+
+    # a move that verifies by exact id: ok, exit 0
+    monkeypatch.setattr(mod, "list_accounts", order("idA"))
+    mod._handle_cli(SimpleNamespace(cmd="switch", target="idB", provider="anthropic", dry_run=False, exact_id=True))
+    assert capsys.readouterr().out.strip().splitlines()[-1] == "CPS_RESULT ok"
+    # a move whose read-back does not confirm the id: unverified, nonzero exit, never "Switched"
+    monkeypatch.setattr(mod, "list_accounts", lambda *a, **k: {"accounts": [
+        {"label": "a@x", "id": "idA", "priority": 0}, {"label": "b@x", "id": "idB", "priority": 1}]})
+    with pytest.raises(SystemExit) as ei:
+        mod._handle_cli(SimpleNamespace(cmd="switch", target="idB", provider="anthropic", dry_run=False, exact_id=True))
+    out = capsys.readouterr().out
+    assert ei.value.code == 1 and out.strip().splitlines()[-1] == "CPS_RESULT unverified"
+    assert "Switch unverified" in out and "Switched" not in out
+    # a failed lookup: failed, nonzero exit
+    with pytest.raises(SystemExit) as ei:
+        mod._handle_cli(SimpleNamespace(cmd="switch", target="nope", provider="anthropic", dry_run=False, exact_id=True))
+    out = capsys.readouterr().out
+    assert ei.value.code == 1 and out.strip().splitlines()[-1] == "CPS_RESULT failed" and "Switch failed" in out
+    # a plan / an already-first no-op: ok, exit 0
+    mod._handle_cli(SimpleNamespace(cmd="plan", target="idB", provider="anthropic", exact_id=True))
+    assert capsys.readouterr().out.strip().splitlines()[-1] == "CPS_RESULT ok"
+    moved.clear()
+    monkeypatch.setattr(mod, "list_accounts", order("idA"))
+    mod._handle_cli(SimpleNamespace(cmd="switch", target="idA", provider="anthropic", dry_run=False, exact_id=True))
+    out = capsys.readouterr().out
+    assert out.strip().splitlines()[-1] == "CPS_RESULT ok" and "No change" in out and moved == []
+
+
+def test_cli_auto_outcomes(mod, monkeypatch, capsys):
+    # declined: still ok=True overall (order unchanged by design) → exit 0
+    _report = {"ok": True, "provider": "anthropic", "alive": [], "exhausted": [], "benched": [],
+               "cooldown_unknown": [], "dead": [], "unknown": [], "promoted": None, "dry_run": False,
+               "declined": {"account": "b@x", "reason": "dead"}}
+    monkeypatch.setattr(mod, "auto_rotate", lambda p, dry_run=False: _report)
+    mod._handle_cli(SimpleNamespace(cmd="auto", provider="anthropic", dry_run=False))
+    assert capsys.readouterr().out.strip().splitlines()[-1] == "CPS_RESULT ok"
+    # report ok=False without a change: failed, nonzero exit
+    _report2 = {"ok": False, "provider": "anthropic", "alive": [], "exhausted": [], "benched": [],
+                "cooldown_unknown": [], "dead": [], "unknown": [], "dry_run": False,
+                "error": "promotion failed: boom"}
+    monkeypatch.setattr(mod, "auto_rotate", lambda p, dry_run=False: _report2)
+    with pytest.raises(SystemExit) as ei:
+        mod._handle_cli(SimpleNamespace(cmd="auto", provider="anthropic", dry_run=False))
+    out = capsys.readouterr().out
+    assert ei.value.code == 1 and out.strip().splitlines()[-1] == "CPS_RESULT failed"
+    # moved but unverifiable: unverified, nonzero exit
+    _report3 = {"ok": False, "provider": "anthropic", "alive": [], "exhausted": [], "benched": [],
+                "cooldown_unknown": [], "dead": [], "unknown": [], "dry_run": False, "changed": True,
+                "error": "promotion could not be verified by entry id"}
+    monkeypatch.setattr(mod, "auto_rotate", lambda p, dry_run=False: _report3)
+    with pytest.raises(SystemExit) as ei:
+        mod._handle_cli(SimpleNamespace(cmd="auto", provider="anthropic", dry_run=False))
+    out = capsys.readouterr().out
+    assert ei.value.code == 1 and out.strip().splitlines()[-1] == "CPS_RESULT unverified"
+
+
+def test_render_switch_never_claims_success_without_verification(mod):
+    assert "Switched" not in mod.render_switch({"ok": True, "dry_run": False, "account": "b@x", "was_priority": 1,
+                                                "verified_first": False, "order_after": ["a@x", "b@x"]})
+    assert "Switch unverified" in mod.render_switch({"ok": True, "dry_run": False, "account": "b@x", "was_priority": 1,
+                                                     "verified_first": False, "order_after": ["a@x", "b@x"]})
+    assert "Switched" in mod.render_switch({"ok": True, "dry_run": False, "account": "b@x", "was_priority": 1,
+                                            "verified_first": True})
+    assert "No change" in mod.render_switch({"ok": True, "dry_run": False, "account": "a@x", "was_priority": 0,
+                                             "already_first": True})
+
+
+def test_node_outcome_contract_and_idless_rows(tmp_path):
+    """The desktop decides success from CPS_RESULT + exit code only; id-less rows are inert."""
+    src = PLUGIN_JS.read_text()
+    src = src.replace("import * as sdk from '@hermes/plugin-sdk'", "const sdk = new Proxy({}, {get: () => () => null})")
+    src = src.replace("import { useState } from 'react'", "const useState = () => [false, () => {}]")
+    src = src.replace("import { jsx, jsxs } from 'react/jsx-runtime'",
+                      "const jsx = (type, props, key) => ({ type, props, key }); const jsxs = jsx")
+    src = src.replace("export default {", "globalThis.__plugin = {")
+    probe = """
+const en = MESSAGES.en
+const t = (k, ...a) => (typeof en[k] === 'function' ? en[k](...a) : en[k])
+const out = {
+  ok: (() => { const r = cliOutcome(0, 'Switched: b@x is now priority 0.\\nCPS_RESULT ok'); return {ok: r.ok, kind: r.kind, message: r.message ?? null} })(),
+  unverified: cliOutcome(0, 'Switch unverified: b@x …\\nCPS_RESULT unverified'),
+  failed: cliOutcome(0, 'Switch failed: boom\\nCPS_RESULT failed'),
+  zeroExitNoLine: cliOutcome(0, 'Switched: b@x is now priority 0.'),
+  nonzeroExit: cliOutcome(1, 'Switch failed: pool not read\\nCPS_RESULT failed'),
+  statusOnly: cliOutcome(0, 'CPS_STATUS {…}'),
+  rowWithId: rowSwitchArgv({ id: 'idB', label: 'b@x' }),
+  unverifiedText: switchFailText({ label: 'b@x' }, 'Switch unverified: b@x was asked to move', t),
+  failedText: switchFailText({ label: 'b@x' }, 'boom', t),
+  rowWithoutId: rowSwitchArgv({ label: 'b@x' }),
+  rowEmptyId: rowSwitchArgv({ id: '', label: 'b@x' }),
+  step3en: MESSAGES.en.step3,
+  step3de: MESSAGES.de.step3
+}
+console.log(JSON.stringify(out))
+"""
+    f = tmp_path / "probe.mjs"
+    f.write_text(src + "\n" + probe)
+    res = _subprocess.run(["node", str(f)], capture_output=True, text=True, timeout=30)
+    assert res.returncode == 0, res.stderr
+    out = _json.loads(res.stdout.strip().splitlines()[-1])
+    assert out["ok"]["ok"] is True and out["ok"]["kind"] == "ok" and out["ok"]["message"] is None
+    assert out["unverified"]["ok"] is False and out["unverified"]["kind"] == "unverified"
+    assert out["failed"]["ok"] is False and out["failed"]["kind"] == "failed" and "boom" in out["failed"]["message"]
+    # the old contract (zero exit + no 'failed' word) must no longer pass as success
+    assert out["zeroExitNoLine"]["ok"] is False
+    assert out["nonzeroExit"]["ok"] is False
+    assert out["statusOnly"]["ok"] is False
+    assert out["rowWithId"] == ["switch", "--exact-id", "idB"]
+    assert "could not confirm" in out["unverifiedText"] and out["unverifiedText"].startswith("b@x")
+    assert out["failedText"] == "Switch failed: boom"
+    assert out["rowWithoutId"] is None and out["rowEmptyId"] is None
+    assert "off by default" in out["step3en"] and "standardm" in out["step3de"]
+    assert "by itself" not in out["step3en"] and "selbst" not in out["step3de"]

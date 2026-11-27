@@ -16,16 +16,22 @@ How it touches Hermes:
   ``load_pool()`` and ``peek()`` are NOT used for reads: they can seed or prune
   entries, clear exhaustion and persist. Rows borrowed from another tool (e.g.
   Claude Code) carry no token in that snapshot, so they show no usage and are never
-  promoted by auto. When the read accessor is missing (older core) a display-only
-  fallback parses ``hermes auth list``; such rows are non-authoritative.
+  promoted by auto. When the read accessor is missing (older core) or the pool cannot
+  be read, every read path fails closed (``PoolReadError``, nonzero CLI exit): there
+  is no ``hermes auth list`` fallback, because that command loads and peeks the pool
+  and can persist core maintenance.
 * **Switching** = "move to priority 0" through ``load_pool().move_entry()`` (the call
   behind ``hermes auth priority``): the only place the real pool is loaded. Auto
   rotation re-validates the exact id on that same pool object right before the move.
   The account is tried first on the next model call (``fill_first`` strategy).
 * **Usage percentages** (list only) go through Hermes' public
-  ``fetch_account_usage(read_only=True, identity_id=<entry id>)``: each usable
-  pooled OAuth token is sent to the provider's own API (api.anthropic.com) by
-  that helper. Dead logins are skipped; no token is refreshed or rotated and no
+  ``fetch_account_usage(read_only=True, identity_id=<entry id>)``. Only tokens of
+  OAuth logins from Hermes' own auth flows (``manual*``, ``hermes_pkce`` ...) are sent
+  to the provider's own API
+  (api.anthropic.com) by that helper, and the entry that supplies each token is
+  re-checked on the snapshot the token comes from (exact unique id, OAuth, not
+  dead, pool-owned): a login that turned borrowed, foreign or dead between the two
+  reads keeps its token at home. No token is refreshed or rotated and no
   cooldown or bench state is written. Hermes' own usage cache may remember the
   returned snapshot, per credential.
 * **Auto rotation** (``auto``) uses the same usage data and ``switch`` (the
@@ -42,7 +48,8 @@ How it touches Hermes:
   keeps one small state file (``credential-pool-switcher-state.json`` in the
   Hermes home: timestamps and the last result, no credentials).
 
-The plugin never reads or writes auth.json itself and never refreshes tokens.
+The plugin has no auth.json path of its own: pool rows are read through core's
+``read_credential_pool`` accessor, and it never writes auth.json or refreshes tokens.
 Tokens are never printed, logged, returned, or written by this plugin.
 """
 
@@ -68,21 +75,10 @@ STATUS_EXHAUSTED = "exhausted"
 STATUS_DEAD = "dead"
 STRATEGY_FILL_FIRST = "fill_first"
 
-_HEADING = re.compile(r"^(?P<provider>\S+)\s+\((?P<count>\d+)\s+credential", re.I)
-# The label column is padded (``{label:<20}``) and may itself contain spaces:
-# take everything lazily up to "<type> id=".
-_ROW = re.compile(
-    r"^(?P<idx>#\d+)\s+(?P<label>.+?)\s+(?P<type>\S+)\s+"
-    r"id=(?P<id>\S+)\s+priority=(?P<priority>-?\d+)\s+(?P<source>\S+)"
-    r"(?P<rest>.*)$"
-)
-# Any exhaustion class the core prints ("rate-limited", "billing", "exhausted",
-# ...) ends with a "(<remaining> left)" group while the bench is still running.
 # A pool row that is exhausted but stores no reset timestamp has a cooldown the
 # core derives from a per-error TTL; this plugin cannot know it and never guesses
 # one: such a row is "cooldown unknown" and is never promoted by auto rotation.
 COOLDOWN_UNKNOWN_NOTE = "(cooldown unknown)"
-_REST_BENCH = re.compile(r"\((?P<left>[^()]*\bleft)\)", re.I)
 
 
 @dataclass
@@ -98,9 +94,9 @@ class Account:
     status: str = "ok"                  # ok | exhausted | dead
     bench_until: Optional[float] = None  # epoch seconds, only while still benched (explicit reset)
     bench_unknown: bool = False          # exhausted, but no stored reset: end of the cooldown unknown
-    # True when read straight from the pool. The CLI-text fallback cannot show dead
-    # logins or an exhausted row without a stored reset, so it sets this to False and
-    # such a row is never treated as proven eligible for an automatic move.
+    # True when read straight from the pool snapshot. Defense in depth: every reader
+    # now builds rows from the snapshot (there is no CLI-text fallback any more), but a
+    # row that is not authoritative is still never treated as proven eligible.
     authoritative: bool = True
 
     @property
@@ -296,36 +292,6 @@ def _run(args: List[str], timeout: int = 60) -> str:
     return "\n".join(lines)
 
 
-def _parse_list(text: str) -> tuple[str, List[Account]]:
-    """Parse ``hermes auth list <provider>`` output (CLI fallback path)."""
-    provider, accounts = "", []
-    for line in text.splitlines():
-        line = line.rstrip()
-        m = _HEADING.search(line)
-        if m:
-            provider = m.group("provider")
-            continue
-        m = _ROW.match(line.strip())
-        if m:
-            rest = m.group("rest") or ""
-            bench = _REST_BENCH.search(rest)
-            accounts.append(
-                Account(
-                    index=int(m.group("idx")[1:]),
-                    label=m.group("label").strip(),
-                    auth_type=m.group("type"),
-                    id=m.group("id"),
-                    priority=int(m.group("priority")),
-                    source=m.group("source"),
-                    current="←" in rest,
-                    notes=[f"({bench.group('left').strip()})"] if bench else [],
-                    status=STATUS_EXHAUSTED if bench else "ok",
-                    authoritative=False,
-                )
-            )
-    return provider, accounts
-
-
 # -- direct pool access ------------------------------------------------------------
 
 class PoolReadError(RuntimeError):
@@ -350,18 +316,20 @@ class _PoolSnapshot:
 
 
 def _load_pool(provider: str):
-    """Non-mutating snapshot of the pool, or None when core has no read accessor.
+    """Non-mutating snapshot of the pool (:class:`_PoolSnapshot`).
 
-    None means "use the CLI-text fallback" (older core). A pool that exists but
-    cannot be read raises :class:`PoolReadError`: nothing is retried through a
-    helper that could write.
+    Fails closed: a missing read accessor (older core) or an unreadable pool raises
+    :class:`PoolReadError`. Nothing is retried through ``load_pool``, ``peek`` or
+    ``hermes auth list``: those can seed or prune entries, clear exhaustion and persist.
     """
     try:
         from agent.credential_pool import PooledCredential  # type: ignore
         from hermes_cli.auth import read_credential_pool  # type: ignore
     except Exception as exc:
-        log.debug("read-only pool accessors not importable (%s); using the CLI fallback", exc)
-        return None
+        log.warning("read-only pool accessors not importable: %s", type(exc).__name__)
+        raise PoolReadError(
+            "this Hermes core has no read-only credential-pool accessor (update Hermes); "
+            "refusing to read through a command that can modify the pool") from exc
     try:
         rows = read_credential_pool(provider)
         entries = [PooledCredential.from_dict(provider, row) for row in rows if isinstance(row, dict)]
@@ -450,16 +418,16 @@ def _accounts_from_pool(pool) -> List[Account]:
 
 
 def _read_accounts(provider: str) -> Tuple[str, List[Account]]:
-    """Pool rows in priority order: direct pool access, CLI parsing as fallback."""
-    pool = _load_pool(provider)  # raises PoolReadError when the pool exists but is unreadable
-    if pool is not None:
-        try:
-            return provider, _accounts_from_pool(pool)
-        except Exception as exc:
-            raise PoolReadError(f"could not interpret the {provider} credential pool ({type(exc).__name__})") from exc
-    # Old core without the read accessor: display-only text fallback (rows are
-    # marked non-authoritative; nothing automatic ever acts on them).
-    return _parse_list(_run(["auth", "list", provider]))
+    """Pool rows in priority order, from the non-mutating snapshot only.
+
+    Raises :class:`PoolReadError` when the snapshot is unavailable: there is no
+    ``hermes auth list`` fallback (that command loads and peeks the pool and can persist).
+    """
+    pool = _load_pool(provider)
+    try:
+        return provider, _accounts_from_pool(pool)
+    except Exception as exc:
+        raise PoolReadError(f"could not interpret the {provider} credential pool ({type(exc).__name__})") from exc
 
 
 # -- usage (public helper) ---------------------------------------------------------
@@ -473,6 +441,50 @@ def _fetch_supports_identity(fetch) -> bool:
     return "identity_id" in params or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
+# Mirrors core's _EXPLICIT_POOL_SOURCES (hermes_cli/auth.py): logins the user created
+# through Hermes' own auth flows. ``hermes auth add anthropic --type oauth`` writes
+# ``manual:hermes_pkce``; ``hermes_pkce`` is Hermes' root-file login. Anything else
+# (``claude_code``, ``env:*``, empty, unknown) is borrowed from or fed by another tool.
+_EXPLICIT_POOL_SOURCES = frozenset({"hermes_pkce", "device_code", "loopback_pkce", "manual"})
+
+
+def _is_pool_owned_source(source: Any) -> bool:
+    """True for logins the user created through Hermes' own auth flows.
+
+    ``manual``, ``manual:<name>`` and the explicit OAuth sources; a token from any
+    other source (``claude_code``, ``env:*``, empty, unknown) is not ours to send
+    anywhere, so it is never probed.
+    """
+    s = str(source or "").strip().lower()
+    return s.startswith("manual:") or s in _EXPLICIT_POOL_SOURCES
+
+
+def _usage_token_entries(entries, wanted: set) -> List[Tuple[str, str]]:
+    """``[(entry_id, token)]`` that may be sent to the usage helper, judged on *entries*.
+
+    *entries* is the snapshot that actually supplies the token (the second read), not
+    the earlier account list: each entry is re-checked here, so a state change between
+    the two reads (dead meanwhile, now borrowed, now an API key, duplicated id) keeps
+    its token at home. Token values are returned to the caller only, never logged.
+    """
+    entries = list(entries)
+    counts: dict = {}
+    for e in entries:
+        eid = str(getattr(e, "id", "") or "")
+        counts[eid] = counts.get(eid, 0) + 1
+    out: List[Tuple[str, str]] = []
+    for e in entries:
+        eid = str(getattr(e, "id", "") or "")
+        token = (getattr(e, "access_token", "") or "").strip()
+        if (not eid or eid not in wanted or counts.get(eid) != 1 or not token
+                or getattr(e, "auth_type", "") != "oauth"
+                or str(getattr(e, "last_status", "") or "") == STATUS_DEAD
+                or not _is_pool_owned_source(getattr(e, "source", ""))):
+            continue
+        out.append((eid, token))
+    return out
+
+
 def _usage_for_accounts(accounts: List[Account], provider: str = DEFAULT_PROVIDER) -> Optional[dict]:
     """Best-effort per-account usage for the list view.
 
@@ -481,7 +493,10 @@ def _usage_for_accounts(accounts: List[Account], provider: str = DEFAULT_PROVIDE
     own usage cache remembering the snapshot, which is why the entry id is passed
     as ``identity_id`` where supported: the cache then stays per credential).
     Dead logins are skipped (their token is useless); benched ones are still
-    read, so their bars show why. An expired idle login simply shows no percentages.
+    read, so their bars show why. Borrowed/foreign sources (claude_code, env, empty,
+    unknown) are never probed, and the entry is re-checked on this second snapshot
+    (exact unique id, OAuth, not dead) before its token is used. An expired idle login
+    simply shows no percentages.
     ``five_hour`` / ``week`` are account-level windows; ``scoped`` is the tightest
     model-family cap and is informational for model-agnostic decisions.
     Returns ``{entry_id: {"five_hour": ..., "week": ..., "scoped": {...}}}`` or None.
@@ -500,15 +515,9 @@ def _usage_for_accounts(accounts: List[Account], provider: str = DEFAULT_PROVIDE
         pool = _load_pool(provider)
     except PoolReadError:
         return None
-    if pool is None:
-        return None
     with_identity = _fetch_supports_identity(fetch_account_usage)
     out: dict = {}
-    for entry in pool.entries():
-        entry_id = str(getattr(entry, "id", "") or "")
-        token = (getattr(entry, "access_token", "") or "").strip()
-        if not entry_id or entry_id not in wanted or getattr(entry, "auth_type", "") != "oauth" or not token:
-            continue
+    for entry_id, token in _usage_token_entries(pool.entries(), wanted):
         try:
             if with_identity:
                 snap = fetch_account_usage(provider, api_key=token, read_only=True, identity_id=entry_id)
@@ -782,8 +791,8 @@ def _move_to_front(provider: str, account: Account, *, exact_id: bool = False,
     ``move_entry`` is used (the CLI fallback resolves by index/label/id and could hit
     another entry), and the very pool object that ``move_entry`` then runs on is
     re-checked first: the id must still be unique, must not collide with a label,
-    and (``require_eligible``) must still be alive, not benched and not of unknown
-    cooldown. Otherwise nothing is moved.
+    and (``require_eligible``) must still be an OAuth login that is alive, not benched and not
+    of unknown cooldown. Otherwise nothing is moved.
     """
     strict = exact_id or require_eligible
     pool = _load_writable_pool(provider)
@@ -819,7 +828,13 @@ def _move_to_front(provider: str, account: Account, *, exact_id: bool = False,
 
 
 def _ineligible_reason(account: Account, now: float) -> Optional[str]:
-    """Why Hermes would not use *account* right now (dead / benched), or None."""
+    """Why *account* may not be promoted automatically right now, or None.
+
+    Used only for the strict (auto rotation) path, where the winner must still be an
+    OAuth login that Hermes would use: not an API key, not dead, not benched.
+    """
+    if account.auth_type != "oauth":
+        return f"no longer an OAuth login (now {account.auth_type or 'unknown'})"
     if account.status == STATUS_DEAD:
         return "dead (re-login needed)"
     if account.bench_unknown:
@@ -1261,15 +1276,22 @@ def render_switch(plan: dict, markdown: bool = False) -> str:
             f"{b}Plan{b}: move {plan['account']} to priority 0 "
             f"(currently {plan['was_priority']})."
         ]
+    elif plan.get("already_first"):
+        lines = [f"{b}No change{b}: {plan['account']} is already priority 0."]
+    elif not plan.get("verified_first"):
+        # Never claim a switch that could not be confirmed (by id where an exact id was asked).
+        lines = [
+            f"{b}Switch unverified{b}: {plan['account']} was asked to move to priority 0, "
+            "but it could not be confirmed as first in the rotation order. Check /switch list."
+        ]
+        if plan.get("order_after"):
+            lines.append("Order read back: " + " → ".join(plan["order_after"]))
     else:
         lines = [
             f"{b}Switched{b}: {plan['account']} is now priority 0 "
-            f"(was {plan['was_priority']})."
+            f"(was {plan['was_priority']}).",
+            "Verified: it is first in the new rotation order.",
         ]
-        if plan.get("verified_first"):
-            lines.append("Verified: it is first in the new rotation order.")
-        elif "order_after" in plan:
-            lines.append("New order: " + " → ".join(plan["order_after"]))
     for key in ("warning", "strategy_note"):
         if plan.get(key):
             lines.append(f"⚠ {plan[key]}")
@@ -1469,29 +1491,61 @@ def _arg(args, name: str, default):
     return default if val is None else val
 
 
+RESULT_PREFIX = "CPS_RESULT "  # last line of switch / plan / auto: ``ok`` | ``failed`` | ``unverified``
+
+
+def _switch_outcome(plan: dict) -> str:
+    """``ok`` only for a plan, an already-first no-op, or a move confirmed first by read-back."""
+    if not plan.get("ok"):
+        return "failed"
+    if plan.get("dry_run") or plan.get("already_first"):
+        return "ok"
+    return "ok" if plan.get("verified_first") is True else "unverified"
+
+
+def _auto_outcome(report: dict) -> str:
+    if report.get("ok"):
+        return "ok"
+    return "unverified" if report.get("changed") else "failed"
+
+
 def _handle_cli(args) -> None:
-    try:
-        _handle_cli_cmd(args)
-    except PoolReadError as exc:
-        print(f"Credential pool not read: {exc}; nothing was changed")
+    """Run one CLI command; a failure or an unverified move exits nonzero.
 
-
-def _handle_cli_cmd(args) -> None:
+    The desktop treats a zero exit as success, so a pool-read error, a refused or failed
+    switch and an unverified move must never exit 0. ``switch`` / ``plan`` / ``auto`` also
+    end with an explicit ``CPS_RESULT <outcome>`` line that the desktop requires.
+    """
     cmd = _arg(args, "cmd", "list")
+    try:
+        outcome = _handle_cli_cmd(args)
+    except PoolReadError as exc:
+        what = {"switch": "Switch failed", "plan": "Switch failed", "auto": "Auto rotation failed"}.get(cmd, "Command failed")
+        print(f"{what}: credential pool not read: {exc}; nothing was changed")
+        outcome = "failed"
+    if cmd in {"switch", "plan", "auto"} and outcome is not None:
+        print(RESULT_PREFIX + outcome)
+    if outcome is not None and outcome != "ok":
+        raise SystemExit(1)
+
+
+def _handle_cli_cmd(args) -> Optional[str]:
+    """Execute and print; returns the outcome for switch / plan / auto, None for read-only commands."""
+    cmd = _arg(args, "cmd", "list")
+    provider = _arg(args, "provider", DEFAULT_PROVIDER)
     if cmd == "list":
-        print(render_list(list_accounts(_arg(args, "provider", DEFAULT_PROVIDER))))
-    elif cmd == "plan":
-        print(render_switch(switch(args.target, _arg(args, "provider", DEFAULT_PROVIDER), dry_run=True,
-                                   exact_id=bool(_arg(args, "exact_id", False)))))
-    elif cmd == "switch":
-        print(render_switch(switch(args.target, _arg(args, "provider", DEFAULT_PROVIDER),
-                                   dry_run=_arg(args, "dry_run", False),
-                                   exact_id=bool(_arg(args, "exact_id", False)))))
+        print(render_list(list_accounts(provider)))
+    elif cmd in ("plan", "switch"):
+        plan = switch(args.target, provider, dry_run=True if cmd == "plan" else _arg(args, "dry_run", False),
+                      exact_id=bool(_arg(args, "exact_id", False)))
+        print(render_switch(plan))
+        return _switch_outcome(plan)
     elif cmd == "auto":
-        print(render_auto(auto_rotate(_arg(args, "provider", DEFAULT_PROVIDER),
-                                      dry_run=_arg(args, "dry_run", False))))
+        report = auto_rotate(provider, dry_run=_arg(args, "dry_run", False))
+        print(render_auto(report))
+        return _auto_outcome(report)
     elif cmd == "status":
-        status = pool_status(_arg(args, "provider", DEFAULT_PROVIDER), with_usage=_arg(args, "usage", False))
+        status = pool_status(provider, with_usage=_arg(args, "usage", False))
         if _arg(args, "json", False):
             print(STATUS_LINE_PREFIX + json.dumps(status, default=str))
         else:
@@ -1499,7 +1553,8 @@ def _handle_cli_cmd(args) -> None:
             print(f"{status['provider']}: {status['state']} · {status['usable']}/{status['count']} usable"
                   + (f" · next: {active['label']}" if active else ""))
     elif cmd == "setup":
-        print(render_setup(pool_status(_arg(args, "provider", DEFAULT_PROVIDER))))
+        print(render_setup(pool_status(provider)))
+    return None
 
 
 _SLASH_USAGE = (
