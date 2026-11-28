@@ -133,7 +133,7 @@ Anthropic only, manual OAuth logins only.
 
 - Reads Anthropic's own usage endpoint per login: any active `limits[]` entry at 100% / severity `critical` benches that login until its latest `resets_at`.
 - Logins that are already benched with a future reset are answered from the stored bench — no usage call (the endpoint rate-limits per-cycle polling) and no rewrite of the bench.
-- An optional 4-token probe double-checks usage-healthy logins before they get priority 0 (catches org spend caps the usage windows do not show). A 429/402 benches the login (until the "regain access" time, else for one hour); other failures are reported as *inconclusive* and never bench. An unknown probe model falls back to the next one.
+- An optional 4-token probe double-checks usage-healthy logins before they get priority 0 (catches org spend caps the usage windows do not show). The probe is built like a real Hermes request (Claude Code system prefix, `claude-code/<installed version> (external, cli)` user agent, `x-app: cli`, OAuth betas) — without that identity Anthropic answers every 5.x model with a masked `429 {"message":"Error"}` even on a free login. A 429/402 with a limit message benches the login (until the "regain access" time, else for one hour); a *masked* 429 (bare "Error", no reset date) on a login whose usage endpoint shows headroom is reported as *inconclusive* and never benches; other failures are *inconclusive* too. An unknown probe model falls back to the next one.
 - The login with the most weekly headroom (then 5h headroom, then priority) is promoted to priority 0 — a freshly reset login at 0% wins.
 - A probed-alive login that still carries a bench is unbenched.
 - Dead logins (refresh token rejected) are listed as "log in anew" and left alone.
@@ -151,3 +151,7 @@ PYTHONPATH=/path/to/hermes-agent pytest tests/
 ## License
 
 MIT
+
+## Changelog
+
+- **1.3.2** — Fix: the auto probe lacked the Claude Code identity (system prefix, `(external, cli)` UA with the installed version, `x-app: cli`), so Anthropic answered every 5.x probe with a masked 429 and healthy logins were benched for an hour on every run. The probe now sends the same identity as Hermes; a masked 429 on a usage-free login is *inconclusive* and never benches. Real limit 429/402 (reset date) still bench.

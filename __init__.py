@@ -37,6 +37,7 @@ import contextlib
 import json
 import logging
 import math
+import os
 import re
 import time
 
@@ -900,25 +901,112 @@ def _probe_reset_at(status: int, body: str) -> Optional[str]:
     return _iso_utc(now + _PROBE_BENCH_FALLBACK_SECONDS)
 
 
+# Claude Code identity the Hermes core itself sends for OAuth logins
+# (agent/anthropic_adapter.py). Anthropic answers an OAuth request that lacks
+# it with a MASKED 429 {"type": "rate_limit_error", "message": "Error"} for
+# every 5.x model, even on a completely free login — so the probe has to look
+# exactly like a real Hermes request: system prefix, "(external, cli)" UA with
+# the current Claude Code version, x-app: cli. Duplicated here on purpose (no
+# private core imports); keep in sync with the core.
+_CLAUDE_CODE_SYSTEM_PREFIX = "You are Claude Code, Anthropic's official CLI for Claude."
+_CLAUDE_CODE_VERSION_FALLBACK = "2.1.74"
+_PROBE_BETAS = "claude-code-20250219,oauth-2025-04-20"
+_claude_code_version_cache: Optional[str] = None
+
+
+def _claude_code_version() -> str:
+    """Installed Claude Code version (``claude --version``), else a static fallback.
+
+    Anthropic rejects OAuth requests whose UA version lags the real release too
+    far, so the installed CLI's version is preferred. Best effort, cached for
+    the process; the fallback is the version the core ships as its own fallback.
+    """
+    global _claude_code_version_cache
+    if _claude_code_version_cache is not None:
+        return _claude_code_version_cache
+    import shutil
+    import subprocess
+
+    version = _CLAUDE_CODE_VERSION_FALLBACK
+    candidates: list = []
+    for name in ("claude", "claude-code"):
+        hit = shutil.which(name)
+        if hit:
+            candidates.append(hit)
+    # GUI/LaunchAgent PATHs lack the usual install prefixes (same list the core probes).
+    for prefix in ("~/.local/bin", "~/.claude/local", "~/bin", "~/.npm-global/bin", "~/.bun/bin",
+                   "~/.volta/bin", "/opt/homebrew/bin", "/usr/local/bin"):
+        for name in ("claude", "claude-code"):
+            path = os.path.join(os.path.expanduser(prefix), name)
+            if os.path.isfile(path) and path not in candidates:
+                candidates.append(path)
+    for cmd in candidates:
+        try:
+            out = subprocess.run([cmd, "--version"], stdin=subprocess.DEVNULL, capture_output=True,
+                                 text=True, encoding="utf-8", errors="replace", timeout=5, check=False)
+        except Exception:
+            continue
+        first = (out.stdout or "").strip().split()[:1]
+        if out.returncode == 0 and first and first[0][:1].isdigit():
+            version = first[0]
+            break
+    _claude_code_version_cache = version
+    return version
+
+
+def _probe_request_parts(token: str, model: str) -> tuple:
+    """``(headers, body)`` of the probe — the same identity the core uses."""
+    headers = {
+        "authorization": f"Bearer {token}",
+        "anthropic-version": "2023-06-01",
+        "anthropic-beta": _PROBE_BETAS,
+        "user-agent": f"claude-code/{_claude_code_version()} (external, cli)",
+        "x-app": "cli",
+        "content-type": "application/json",
+    }
+    body = {
+        "model": model, "max_tokens": 4,
+        "system": [{"type": "text", "text": _CLAUDE_CODE_SYSTEM_PREFIX}],
+        "messages": [{"role": "user", "content": "ping"}],
+    }
+    return headers, body
+
+
+def _is_masked_429(status: int, body: str) -> bool:
+    """A 429 whose body only says "Error": no limit name, no reset date.
+
+    That is what Anthropic returns for a request it does not accept as a
+    Claude Code request — not evidence that the login is exhausted.
+    """
+    if status != 429 or _RE_GAIN_DATE.search(body or ""):
+        return False
+    text = (body or "").strip()
+    if not text:
+        return True
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return text.strip(" \"'.").lower() == "error"
+    if isinstance(data, dict):
+        err = data.get("error")
+        msg = data.get("message")
+        if isinstance(err, dict):
+            msg = err.get("message", msg)
+        elif isinstance(err, str) and msg is None:
+            msg = err
+        return isinstance(msg, str) and msg.strip().lower() in ("error", "")
+    return False
+
+
 def _probe_once(label: str, token: str, model: str) -> dict:
-    import json as _json
     import urllib.error
     import urllib.request
 
+    headers, payload = _probe_request_parts(token, model)
     req = urllib.request.Request(
         "https://api.anthropic.com/v1/messages",
-        data=_json.dumps({
-            "model": model, "max_tokens": 4,
-            "messages": [{"role": "user", "content": "ping"}],
-        }).encode(),
-        headers={
-            "authorization": f"Bearer {token}",
-            "anthropic-version": "2023-06-01",
-            # Claude Code identity — OAuth requests are rejected without it.
-            "anthropic-beta": "claude-code-20250219,oauth-2025-04-20",
-            "User-Agent": "claude-code/2.1.74",
-            "content-type": "application/json",
-        },
+        data=json.dumps(payload).encode(),
+        headers=headers,
     )
     try:
         with urllib.request.urlopen(req, timeout=_PROBE_TIMEOUT_SECONDS) as resp:
@@ -930,6 +1018,7 @@ def _probe_once(label: str, token: str, model: str) -> dict:
             "alive": False if ex.code in (429, 402) else None,
             "status": ex.code,
             "model": model,
+            "masked": _is_masked_429(ex.code, body),
             "reset_at": _probe_reset_at(ex.code, body),
             "note": body[:160],
         }
@@ -1087,7 +1176,18 @@ def auto_rotate(
         for a in alive:
             p = _probe_anthropic_login(a["label"], tokens[a["label"]], model)
             probes[a["label"]] = p
-            if p.get("alive") is False and p.get("reset_at"):
+            info = usage.get(a["label"]) or {}
+            usage_free = (
+                not info.get("dead_until")
+                and not info.get("error")
+                and _pct(info.get("week_pct"), 0.0) < 100
+                and _pct(info.get("session_pct"), 0.0) < 100
+            )
+            if p.get("masked") and usage_free:
+                # A bare 429 "Error" with the usage endpoint under 100 % is
+                # Anthropic's masked reject, not a limit: never bench on it.
+                inconclusive[a["label"]] = "masked HTTP 429 (usage endpoint shows headroom)"
+            elif p.get("alive") is False and p.get("reset_at"):
                 dead.append((a, {"reset_at": p["reset_at"], "why": f"probe HTTP {p.get('status')}",
                                  "cached": False}))
             elif p.get("alive") is None:
