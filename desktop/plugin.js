@@ -123,12 +123,24 @@ const MESSAGES = {
 // zero exit or the absence of a 'failed' word: a pool-read error, a refused switch
 // and an unverified move all report failure here.
 function cliOutcome(code, output) {
-  if (code !== 0) return { ok: false, kind: 'failed', message: output.trim().split('\n').filter((l) => !l.startsWith(RESULT_PREFIX)).pop() || `exit ${code}` }
-  const outcome = output.split('\n').map((l) => l.trim()).filter((l) => l.startsWith(RESULT_PREFIX)).pop()
-  if (!outcome) return { ok: false, kind: 'failed', message: 'no result line from the switcher CLI' }
-  const kind = outcome.slice(RESULT_PREFIX.length).trim()
-  if (kind === 'ok') return { ok: true, kind }
-  return { ok: false, kind, message: output.trim().split('\n').filter((l) => !l.startsWith(RESULT_PREFIX) && !l.startsWith(PREFIX)).join(' ') || kind }
+  const lines = output.split('\n').map((l) => l.trim())
+  // The result line is read first, whatever the exit code: an unverified move exits nonzero
+  // by design, so the exit code alone would turn it into a plain "failed".
+  const outcome = lines.filter((l) => l.startsWith(RESULT_PREFIX)).pop()
+  const kind = outcome ? outcome.slice(RESULT_PREFIX.length).trim() : ''
+  if (kind === 'ok' && code === 0) return { ok: true, kind }
+  const body = lines.filter((l) => l && !l.startsWith(RESULT_PREFIX) && !l.startsWith(PREFIX))
+  if (kind === 'unverified') {
+    // Prefer the "Switch unverified…" line so the toast is classified as unverified.
+    const line = body.find((l) => /unverified/i.test(l))
+    return { ok: false, kind, message: line || body.join(' ') || kind }
+  }
+  if (!outcome) {
+    return { ok: false, kind: 'failed', message: code !== 0 ? body.pop() || `exit ${code}` : 'no result line from the switcher CLI' }
+  }
+  // `ok` with a nonzero exit, `failed`, or any unknown kind: never a success.
+  if (code !== 0) return { ok: false, kind: kind === 'ok' ? 'failed' : kind, message: body.pop() || `exit ${code}` }
+  return { ok: false, kind, message: body.join(' ') || kind }
 }
 
 // A row click must carry the credential's entry id: pass it as an exact id (no label /

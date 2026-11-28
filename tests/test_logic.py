@@ -1408,10 +1408,16 @@ const out = {
   failed: cliOutcome(0, 'Switch failed: boom\\nCPS_RESULT failed'),
   zeroExitNoLine: cliOutcome(0, 'Switched: b@x is now priority 0.'),
   nonzeroExit: cliOutcome(1, 'Switch failed: pool not read\\nCPS_RESULT failed'),
+  nonzeroUnverified: cliOutcome(1, 'Switch unverified: b@x was asked to move to priority 0.\\nOrder read back: a@x → b@x\\nCPS_RESULT unverified'),
+  nonzeroFailed: cliOutcome(1, 'Switch failed: pool not read\\nCPS_RESULT failed'),
+  nonzeroOkLine: cliOutcome(1, 'Switched: b@x is now priority 0.\\nCPS_RESULT ok'),
+  nonzeroNoLine: cliOutcome(2, 'Traceback boom'),
   statusOnly: cliOutcome(0, 'CPS_STATUS {…}'),
   rowWithId: rowSwitchArgv({ id: 'idB', label: 'b@x' }),
   unverifiedText: switchFailText({ label: 'b@x' }, 'Switch unverified: b@x was asked to move', t),
   failedText: switchFailText({ label: 'b@x' }, 'boom', t),
+  unverifiedFromExit1: (() => { const r = cliOutcome(1, 'Switch unverified: b@x was asked to move to priority 0.\\nOrder read back: a@x → b@x\\nCPS_RESULT unverified'); return switchFailText({ label: 'b@x' }, r.message, t) })(),
+  failedFromExit1: (() => { const r = cliOutcome(1, 'Switch failed: pool not read\\nCPS_RESULT failed'); return switchFailText({ label: 'b@x' }, r.message, t) })(),
   rowWithoutId: rowSwitchArgv({ label: 'b@x' }),
   rowEmptyId: rowSwitchArgv({ id: '', label: 'b@x' }),
   step3en: MESSAGES.en.step3,
@@ -1434,6 +1440,15 @@ console.log(JSON.stringify(out))
     assert out["zeroExitNoLine"]["ok"] is False
     assert out["nonzeroExit"]["ok"] is False
     assert out["statusOnly"]["ok"] is False
+    # realistic exit 1: the result line decides the kind, and nothing here is a success
+    nu = out["nonzeroUnverified"]
+    assert nu["ok"] is False and nu["kind"] == "unverified" and nu["message"].startswith("Switch unverified")
+    assert "could not confirm" in out["unverifiedFromExit1"]
+    nf = out["nonzeroFailed"]
+    assert nf["ok"] is False and nf["kind"] == "failed" and nf["message"] == "Switch failed: pool not read"
+    assert out["failedFromExit1"] == "Switch failed: Switch failed: pool not read"
+    assert out["nonzeroOkLine"]["ok"] is False
+    assert out["nonzeroNoLine"]["ok"] is False and out["nonzeroNoLine"]["message"] == "Traceback boom"
     assert out["rowWithId"] == ["switch", "--exact-id", "idB"]
     assert "could not confirm" in out["unverifiedText"] and out["unverifiedText"].startswith("b@x")
     assert out["failedText"] == "Switch failed: boom"
