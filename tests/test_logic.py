@@ -11,6 +11,8 @@ import contextlib
 import datetime
 import importlib
 import importlib.util
+import json
+import os
 import sys
 import time
 import types
@@ -207,6 +209,153 @@ def test_auto_flags_inconclusive_probe(mod, monkeypatch):
     assert report["alive"] == ["a@x"]
     assert report["probe_inconclusive"] == {"a@x": "HTTP 503"}
     assert "probe inconclusive" in mod.render_auto(report)
+
+
+# -- probe identity + masked 429 ------------------------------------------------------
+
+class _FakeResp:
+    def __init__(self, status=200):
+        self.status = status
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def _http_error(code, body):
+    import io
+    import urllib.error
+
+    return urllib.error.HTTPError("https://api.anthropic.com/v1/messages", code, "x", {},
+                                  io.BytesIO(body.encode()))
+
+
+def _capture_urlopen(monkeypatch, outcome):
+    import urllib.request
+
+    seen = {}
+
+    def fake_urlopen(req, timeout=None):
+        seen["url"] = req.full_url
+        seen["headers"] = {k.lower(): v for k, v in req.header_items()}
+        seen["body"] = json.loads(req.data.decode())
+        result = outcome() if callable(outcome) else outcome  # callable: fresh error per call
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    return seen
+
+
+def test_probe_request_carries_claude_code_identity(mod, monkeypatch):
+    monkeypatch.setattr(mod, "_claude_code_version", lambda: "9.8.7")
+    seen = _capture_urlopen(monkeypatch, _FakeResp(200))
+    res = mod._probe_once("a@x", "SECRET-TOKEN", "claude-haiku-5-5")
+    assert res["alive"] is True and res["status"] == 200
+    assert "SECRET-TOKEN" not in json.dumps(res)
+    h = seen["headers"]
+    assert seen["url"] == "https://api.anthropic.com/v1/messages"
+    assert h["authorization"] == "Bearer SECRET-TOKEN"
+    assert h["user-agent"] == "claude-code/9.8.7 (external, cli)"
+    assert h["x-app"] == "cli"
+    assert h["anthropic-beta"] == "claude-code-20250219,oauth-2025-04-20"
+    assert h["anthropic-version"] == "2023-06-01"
+    assert seen["body"]["system"] == [
+        {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."}]
+    assert seen["body"]["model"] == "claude-haiku-5-5" and seen["body"]["max_tokens"] == 4
+
+
+def test_claude_code_version_prefers_installed_cli_then_fallback(mod, monkeypatch):
+    import shutil
+    import subprocess
+
+    monkeypatch.setattr(shutil, "which", lambda name: "/fake/claude" if name == "claude" else None)
+    monkeypatch.setattr(os.path, "isfile", lambda p: False)
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        return SimpleNamespace(returncode=0, stdout="2.1.325 (Claude Code)\n")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert mod._claude_code_version() == "2.1.325"
+    assert mod._claude_code_version() == "2.1.325" and len(calls) == 1  # cached
+
+    mod._claude_code_version_cache = None
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    assert mod._claude_code_version() == mod._CLAUDE_CODE_VERSION_FALLBACK
+
+
+def test_probe_masked_429_is_flagged(mod, monkeypatch):
+    monkeypatch.setattr(mod, "_claude_code_version", lambda: "9.8.7")
+    for body in ('{"type":"rate_limit_error","message":"Error"}',
+                 '{"type":"error","error":{"type":"rate_limit_error","message":"Error"}}',
+                 '{"error":"Error"}', ""):
+        _capture_urlopen(monkeypatch, _http_error(429, body))
+        res = mod._probe_once("a@x", "tok", "claude-haiku-5-5")
+        assert res["status"] == 429 and res["masked"] is True, body
+
+
+def test_probe_real_limit_429_is_not_masked(mod, monkeypatch):
+    monkeypatch.setattr(mod, "_claude_code_version", lambda: "9.8.7")
+    future = datetime.date.today() + datetime.timedelta(days=2)
+    for body in (f'{{"error":{{"message":"You will regain access on {future} at 14:00 UTC"}}}}',
+                 '{"error":{"type":"rate_limit_error","message":"Number of request tokens has exceeded your limit"}}'):
+        _capture_urlopen(monkeypatch, _http_error(429, body))
+        res = mod._probe_once("a@x", "tok", "claude-haiku-5-5")
+        assert res["masked"] is False and res["alive"] is False and res["reset_at"]
+    _capture_urlopen(monkeypatch, _http_error(402, ""))
+    assert mod._probe_once("a@x", "tok", "claude-haiku-5-5")["masked"] is False
+
+
+def test_auto_masked_probe_429_with_free_usage_never_benches(mod, monkeypatch):
+    usage = {
+        "a@x": {"dead_until": None, "active_limits": [], "week_pct": 0, "session_pct": 0, "cached": False},
+        "b@x": {"dead_until": None, "active_limits": [], "week_pct": 89, "session_pct": 3, "cached": False},
+    }
+    writes, switched = _auto_env(mod, monkeypatch, usage)
+    monkeypatch.setattr(mod, "_claude_code_version", lambda: "9.8.7")
+    _capture_urlopen(monkeypatch, lambda: _http_error(429, '{"type":"rate_limit_error","message":"Error"}'))
+    report = mod.auto_rotate(probe=True)
+    assert writes["benched"] == {}
+    assert report["dead"] == {} and report["benched"] == {}
+    assert report["alive"] == ["a@x", "b@x"]
+    assert set(report["probe_inconclusive"]) == {"a@x", "b@x"}
+    assert "masked" in report["probe_inconclusive"]["a@x"]
+    assert report["all_dead"] is False
+
+
+def test_auto_real_limit_probe_429_still_benches(mod, monkeypatch):
+    usage = {
+        "a@x": {"dead_until": None, "active_limits": [], "week_pct": 10, "session_pct": 10, "cached": False},
+        "b@x": {"dead_until": None, "active_limits": [], "week_pct": 20, "session_pct": 5, "cached": False},
+    }
+    writes, switched = _auto_env(mod, monkeypatch, usage)
+    monkeypatch.setattr(mod, "_claude_code_version", lambda: "9.8.7")
+    future = datetime.date.today() + datetime.timedelta(days=2)
+    monkeypatch.setattr(mod, "_probe_anthropic_login", lambda label, token, model: (
+        mod._probe_once(label, token, model)))
+    _capture_urlopen(monkeypatch, lambda: _http_error(
+        429, f'{{"error":{{"message":"You will regain access on {future} at 14:00 UTC"}}}}'))
+    report = mod.auto_rotate(probe=True)
+    assert set(writes["benched"]) == {"a@x", "b@x"}
+    assert report["alive"] == [] and report["probe_inconclusive"] == {}
+    assert str(future) in report["dead"]["a@x"]
+
+
+def test_auto_masked_probe_429_at_full_usage_keeps_old_bench_path(mod, monkeypatch):
+    # Usage under the threshold but the endpoint reports 100 % on the session
+    # window without an active limit entry: masked probe results are then NOT
+    # excused, the old one-hour fallback bench applies.
+    usage = {"a@x": {"dead_until": None, "active_limits": [], "week_pct": 10, "session_pct": 100, "cached": False}}
+    writes, _ = _auto_env(mod, monkeypatch, usage, labels=("a@x",))
+    monkeypatch.setattr(mod, "_probe_anthropic_login", lambda label, token, model: {
+        "label": label, "alive": False, "status": 429, "masked": True, "reset_at": _iso(time.time() + 3600)})
+    report = mod.auto_rotate(probe=True)
+    assert set(writes["benched"]) == {"a@x"} and report["probe_inconclusive"] == {}
 
 
 # -- auth.json write safety ----------------------------------------------------------
