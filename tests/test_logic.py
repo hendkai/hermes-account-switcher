@@ -1418,6 +1418,20 @@ const out = {
   failedText: switchFailText({ label: 'b@x' }, 'boom', t),
   unverifiedFromExit1: (() => { const r = cliOutcome(1, 'Switch unverified: b@x was asked to move to priority 0.\\nOrder read back: a@x → b@x\\nCPS_RESULT unverified'); return switchFailText({ label: 'b@x' }, r.message, t) })(),
   failedFromExit1: (() => { const r = cliOutcome(1, 'Switch failed: pool not read\\nCPS_RESULT failed'); return switchFailText({ label: 'b@x' }, r.message, t) })(),
+  // round 2: shapes copied from render_switch / render_auto / _handle_cli
+  autoUnverified: cliOutcome(1, 'Auto rotation (anthropic)\\n✓ a@x usage-eligible (5h/week below 100%; not verified by a message)\\n✓ unverified-acct usage-eligible (5h/week below 100%; not verified by a message)\\n⚠ promotion could not be verified by entry id\\nCPS_RESULT unverified'),
+  autoFailedPrefix: cliOutcome(1, 'Auto rotation failed: credential pool not read: boom; nothing was changed\\nCPS_RESULT failed'),
+  autoFailedReport: cliOutcome(1, 'Auto rotation (anthropic)\\n✓ a@x usage-eligible (5h/week below 100%; not verified by a message)\\n⚠ promotion failed: exact entry id lookup failed: id gone\\nCPS_RESULT failed'),
+  autoToastEn: (() => { const r = cliOutcome(1, 'Auto rotation failed: credential pool not read: boom; nothing was changed\\nCPS_RESULT failed'); return en.autoFailed(r.message) })(),
+  autoToastDe: (() => { const r = cliOutcome(1, 'Auto rotation failed: credential pool not read: boom; nothing was changed\\nCPS_RESULT failed'); return MESSAGES.de.autoFailed(r.message) })(),
+  autoUnverifiedToastEn: (() => { const r = cliOutcome(1, 'Auto rotation (anthropic)\\n✓ a@x usage-eligible (5h/week below 100%; not verified by a message)\\n⚠ promotion could not be verified by entry id\\nCPS_RESULT unverified'); return en.autoFailed(r.message) })(),
+  labelFailedEn: (() => { const r = cliOutcome(1, 'Switch failed: unverified-acct is now dead (re-login needed); order left unchanged\\nCPS_RESULT failed'); return switchFailText({ label: 'unverified-acct' }, r.message, t, r.kind) })(),
+  labelFailedDe: (() => { const r = cliOutcome(1, 'Switch failed: unverified-acct is now dead (re-login needed); order left unchanged\\nCPS_RESULT failed'); return switchFailText({ label: 'unverified-acct' }, r.message, (k, ...a) => (typeof MESSAGES.de[k] === 'function' ? MESSAGES.de[k](...a) : MESSAGES.de[k]), r.kind) })(),
+  labelUnverifiedKind: switchFailText({ label: 'plain@x' }, 'anything at all', t, 'unverified'),
+  labelUnverifiedKindDe: switchFailText({ label: 'unverified-acct' }, 'order left unchanged', (k, ...a) => (typeof MESSAGES.de[k] === 'function' ? MESSAGES.de[k](...a) : MESSAGES.de[k]), 'unverified'),
+  failedKindWinsOverText: switchFailText({ label: 'b@x' }, 'Switch unverified: whatever', t, 'failed'),
+  switchFailedToastEn: (() => { const r = cliOutcome(1, 'Switch failed: pool not read\\nCPS_RESULT failed'); return switchFailText({ label: 'b@x' }, r.message, t, r.kind) })(),
+  switchFailedToastDe: (() => { const r = cliOutcome(1, 'Switch failed: pool not read\\nCPS_RESULT failed'); return switchFailText({ label: 'b@x' }, r.message, (k, ...a) => (typeof MESSAGES.de[k] === 'function' ? MESSAGES.de[k](...a) : MESSAGES.de[k]), r.kind) })(),
   rowWithoutId: rowSwitchArgv({ label: 'b@x' }),
   rowEmptyId: rowSwitchArgv({ id: '', label: 'b@x' }),
   step3en: MESSAGES.en.step3,
@@ -1445,12 +1459,36 @@ console.log(JSON.stringify(out))
     assert nu["ok"] is False and nu["kind"] == "unverified" and nu["message"].startswith("Switch unverified")
     assert "could not confirm" in out["unverifiedFromExit1"]
     nf = out["nonzeroFailed"]
-    assert nf["ok"] is False and nf["kind"] == "failed" and nf["message"] == "Switch failed: pool not read"
-    assert out["failedFromExit1"] == "Switch failed: Switch failed: pool not read"
+    # the CLI's own leading "Switch failed:" is dropped: the toast adds its prefix once
+    assert nf["ok"] is False and nf["kind"] == "failed" and nf["message"] == "pool not read"
+    assert out["failedFromExit1"] == "Switch failed: pool not read"
+    assert out["switchFailedToastEn"] == "Switch failed: pool not read"
+    assert out["switchFailedToastDe"] == "Wechsel fehlgeschlagen: pool not read"
+    assert out["autoToastEn"] == "Auto rotation failed: credential pool not read: boom; nothing was changed"
+    assert out["autoToastDe"] == "Auto-Rotation fehlgeschlagen: credential pool not read: boom; nothing was changed"
+    assert out["autoFailedPrefix"]["message"].startswith("credential pool not read")
+    assert out["autoFailedReport"]["message"] == "⚠ promotion failed: exact entry id lookup failed: id gone"
+    # an unverified auto run (real render_auto shape: no line says "unverified") shows only its
+    # last line, not the whole report, and a login labelled "unverified-acct" cannot hijack it
+    au = out["autoUnverified"]
+    assert au["ok"] is False and au["kind"] == "unverified"
+    assert au["message"] == "⚠ promotion could not be verified by entry id"
+    assert out["autoUnverifiedToastEn"] == "Auto rotation failed: ⚠ promotion could not be verified by entry id"
+    # S2: the toast kind follows the CLI result kind, never the login's label
+    assert out["labelFailedEn"].startswith("Switch failed: unverified-acct is now dead")
+    assert "may or may not" not in out["labelFailedEn"]
+    assert out["labelFailedDe"].startswith("Wechsel fehlgeschlagen: unverified-acct is now dead")
+    assert out["failedKindWinsOverText"].startswith("Switch failed:")
+    assert "could not confirm" in out["labelUnverifiedKind"] and "plain@x" in out["labelUnverifiedKind"]
+    assert "konnte nicht best" in out["labelUnverifiedKindDe"] and "unverified-acct" in out["labelUnverifiedKindDe"]
+    # S3: the unverified toast does not claim the move happened
+    for key in ("unverifiedText", "labelUnverifiedKind", "labelUnverifiedKindDe"):
+        assert "was moved" not in out[key] and "verschoben" not in out[key], key
+    assert "may or may not have changed" in out["labelUnverifiedKind"] and "eventuell" in out["labelUnverifiedKindDe"]
     assert out["nonzeroOkLine"]["ok"] is False
     assert out["nonzeroNoLine"]["ok"] is False and out["nonzeroNoLine"]["message"] == "Traceback boom"
     assert out["rowWithId"] == ["switch", "--exact-id", "idB"]
-    assert "could not confirm" in out["unverifiedText"] and out["unverifiedText"].startswith("b@x")
+    assert "could not confirm" in out["unverifiedText"] and "b@x" in out["unverifiedText"]
     assert out["failedText"] == "Switch failed: boom"
     assert out["rowWithoutId"] is None and out["rowEmptyId"] is None
     assert "off by default" in out["step3en"] and "standardm" in out["step3de"]

@@ -69,7 +69,7 @@ const MESSAGES = {
     usageError: 'Usage could not be read \u2014 the credential pool was unavailable',
     switched: (label) => `Claude account switched: ${label} is used first`,
     switchFailed: (msg) => `Switch failed: ${msg}`,
-    switchUnverified: (label) => `${label} was moved, but the switcher could not confirm it is used first — check the list.`,
+    switchUnverified: (label) => `The switcher could not confirm that ${label} is now used first — the order may or may not have changed; check the list.`,
     autoDone: 'Auto rotation finished',
     autoFailed: (msg) => `Auto rotation failed: ${msg}`,
     autoOn: (mins, last) => `Auto-switch on \u00b7 every ${mins} min` + (last ? ` \u00b7 last check ${last}` : ''),
@@ -107,7 +107,7 @@ const MESSAGES = {
     usageError: 'Nutzung nicht lesbar \u2014 der Credential-Pool war nicht erreichbar',
     switched: (label) => `Claude-Account gewechselt: ${label} wird zuerst genutzt`,
     switchFailed: (msg) => `Wechsel fehlgeschlagen: ${msg}`,
-    switchUnverified: (label) => `${label} wurde verschoben, aber der Switcher konnte nicht best\u00e4tigen, dass er zuerst genutzt wird — Liste pr\u00fcfen.`,
+    switchUnverified: (label) => `Der Switcher konnte nicht best\u00e4tigen, dass ${label} jetzt zuerst genutzt wird — die Reihenfolge hat sich eventuell ge\u00e4ndert; Liste pr\u00fcfen.`,
     autoDone: 'Auto-Rotation fertig',
     autoFailed: (msg) => `Auto-Rotation fehlgeschlagen: ${msg}`,
     autoOn: (mins, last) => `Auto-Switch an \u00b7 alle ${mins} Min.` + (last ? ` \u00b7 zuletzt gepr\u00fcft ${last}` : ''),
@@ -122,7 +122,17 @@ const MESSAGES = {
 // when the outcome is not ok. Success is decided ONLY by that pair, never by a
 // zero exit or the absence of a 'failed' word: a pool-read error, a refused switch
 // and an unverified move all report failure here.
+// The CLI line already starts with its own English "Switch failed:" / "Auto rotation failed:";
+// the toast adds its (localized) prefix, so drop the CLI's to avoid "Switch failed: Switch failed: …".
+const CLI_FAIL_PREFIX = /^(?:Switch failed|Auto rotation failed|Command failed):\s*/i
+const stripCliPrefix = (m) => String(m).replace(CLI_FAIL_PREFIX, '')
+
 function cliOutcome(code, output) {
+  const r = cliOutcomeRaw(code, output)
+  return r.ok ? r : { ...r, message: stripCliPrefix(r.message) }
+}
+
+function cliOutcomeRaw(code, output) {
   const lines = output.split('\n').map((l) => l.trim())
   // The result line is read first, whatever the exit code: an unverified move exits nonzero
   // by design, so the exit code alone would turn it into a plain "failed".
@@ -131,9 +141,10 @@ function cliOutcome(code, output) {
   if (kind === 'ok' && code === 0) return { ok: true, kind }
   const body = lines.filter((l) => l && !l.startsWith(RESULT_PREFIX) && !l.startsWith(PREFIX))
   if (kind === 'unverified') {
-    // Prefer the "Switch unverified…" line so the toast is classified as unverified.
-    const line = body.find((l) => /unverified/i.test(l))
-    return { ok: false, kind, message: line || body.join(' ') || kind }
+    // Prefer the "Switch unverified…" line (switch); an auto report has no such line, so use
+    // its last line (the "⚠ promotion could not be verified…" error), never the whole report.
+    const line = body.find((l) => l.startsWith('Switch unverified'))
+    return { ok: false, kind, message: line || body.pop() || kind }
   }
   if (!outcome) {
     return { ok: false, kind: 'failed', message: code !== 0 ? body.pop() || `exit ${code}` : 'no result line from the switcher CLI' }
@@ -152,8 +163,11 @@ function rowSwitchArgv(row) {
 }
 
 // A move that ran but could not be confirmed deserves its own wording, not "failed".
-function switchFailText(row, message, t) {
-  return /unverified/i.test(String(message)) ? t('switchUnverified', row.label) : t('switchFailed', message)
+// The kind comes from the CLI result line; the message regex is only a fallback when no kind is
+// known, because a login labelled "unverified-acct" must not turn a failed switch into "moved".
+function switchFailText(row, message, t, kind) {
+  const unverified = kind ? kind === 'unverified' : /unverified/i.test(String(message))
+  return unverified ? t('switchUnverified', row.label) : t('switchFailed', message)
 }
 
 // ── data ──────────────────────────────────────────────────────────────────────
@@ -319,10 +333,10 @@ function Panel({ status, t }) {
     try {
       const { code, output } = await runCli(argv, argv[0] === 'auto' ? 180 : 60)
       const outcome = cliOutcome(code, output)
-      if (!outcome.ok) throw new Error(outcome.message)
+      if (!outcome.ok) throw Object.assign(new Error(outcome.message), { cliKind: outcome.kind })
       host.notify({ kind: 'success', message: okMsg })
     } catch (err) {
-      host.notify({ kind: 'error', message: failMsg(err?.message || String(err)) })
+      host.notify({ kind: 'error', message: failMsg(err?.message || String(err), err?.cliKind) })
     } finally {
       setBusy(false)
       refreshAll()
@@ -333,7 +347,7 @@ function Panel({ status, t }) {
   // id is never switchable — there is no friendly-label fallback for clicks.
   const onSwitch = (row) => {
     const argv = rowSwitchArgv(row)
-    if (argv) act(argv, t('switched', row.label), (m) => switchFailText(row, m, t))
+    if (argv) act(argv, t('switched', row.label), (m, kind) => switchFailText(row, m, t, kind))
   }
   const dead = status.accounts.filter((r) => r.status === 'dead')
 
